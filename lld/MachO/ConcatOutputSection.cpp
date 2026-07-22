@@ -9,6 +9,7 @@
 #include "ConcatOutputSection.h"
 #include "Config.h"
 #include "OutputSegment.h"
+#include "Sections.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
 #include "SyntheticSections.h"
@@ -245,8 +246,41 @@ bool TextOutputSection::isTargetStubsAndInRange(
   return *estimatedStubsEnd <= highVA;
 }
 
+static StringRef branchRangeExtensionModeName(BranchRangeExtensionMode mode) {
+  switch (mode) {
+  case BranchRangeExtensionMode::thunks:
+    return "thunks";
+  case BranchRangeExtensionMode::islandsSlopFree:
+    return "islands-slop-free";
+  case BranchRangeExtensionMode::thunkExact:
+    return "thunk-exact";
+  case BranchRangeExtensionMode::mold:
+    return "mold";
+  case BranchRangeExtensionMode::hybrid:
+    return "hybrid";
+  }
+  llvm_unreachable("unknown branch range extension mode");
+}
+
+static void logFinalizationMode(const TextOutputSection *osec, StringRef mode) {
+  log("finalization mode for " + osec->parent->name + "," + osec->name +
+      ": " + mode);
+}
+
 void TextOutputSection::finalize() {
+  BranchRangeExtensionMode mode = config->branchRangeExtensionMode;
+  if ((mode == BranchRangeExtensionMode::mold ||
+       mode == BranchRangeExtensionMode::hybrid ||
+       mode == BranchRangeExtensionMode::thunkExact ||
+       mode == BranchRangeExtensionMode::islandsSlopFree) &&
+      target->usesIslands() &&
+      sections::isCodeSection(name, parent->name, flags)) {
+    logFinalizationMode(this, branchRangeExtensionModeName(mode));
+    finalizeWithExtenders(mode);
+    return;
+  }
   if (!needsThunks()) {
+    logFinalizationMode(this, "no-thunks");
     for (ConcatInputSection *isec : inputs)
       finalizeOne(isec);
     return;
@@ -260,6 +294,8 @@ void TextOutputSection::finalize() {
   // can still direct call to their targets after they have all been finalized.
   SmallVector<std::tuple<ConcatInputSection *, Relocation *, Defined *>>
       deferredBranchRedirects;
+  logFinalizationMode(this, branchRangeExtensionModeName(
+                                config->branchRangeExtensionMode));
 
   const uint64_t slop = config->slopScale * target->thunkSize;
   for (auto *isec : inputs) {

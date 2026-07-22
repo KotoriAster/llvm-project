@@ -104,6 +104,10 @@ public:
     llvm_unreachable("target does not use thunks");
   }
 
+  virtual void populateIsland(InputSection *island, Symbol *funcSym) {
+    llvm_unreachable("target does not use branch islands");
+  }
+
   const RelocAttrs &getRelocAttrs(uint8_t type) const {
     assert(type < relocAttrs.size() && "invalid relocation type");
     if (type >= relocAttrs.size())
@@ -116,6 +120,7 @@ public:
   }
 
   bool usesThunks() const { return thunkSize > 0; }
+  bool usesIslands() const { return islandSize > 0; }
 
   // For now, handleDtraceReloc only implements -no_dtrace_dof, and ensures
   // that the linking would not fail even when there are user-provided dtrace
@@ -142,6 +147,7 @@ public:
   size_t wordSize;
 
   size_t thunkSize = 0;
+  size_t islandSize = 0;
   uint64_t forwardBranchRange = 0;
   uint64_t backwardBranchRange = 0;
 

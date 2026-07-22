@@ -35,6 +35,7 @@ struct ARM64 : ARM64Common {
                             Symbol *objcMsgSend) const override;
   void populateThunk(InputSection *thunk, Symbol *funcSym,
                      int64_t addend) override;
+  void populateIsland(InputSection *island, Symbol *funcSym) override;
 
   void initICFSafeThunkBody(InputSection *thunk,
                             Symbol *targetSym) const override;
@@ -175,6 +176,21 @@ void ARM64::populateThunk(InputSection *thunk, Symbol *funcSym,
                              /*offset=*/0, /*addend=*/addend,
                              /*referent=*/funcSym);
 }
+
+// A branch island preserves all registers and may be chained to other islands.
+static constexpr uint32_t islandCode[] = {
+    0x14000000, // b <target>
+};
+
+void ARM64::populateIsland(InputSection *island, Symbol *funcSym) {
+  island->align = 4;
+  island->data = {reinterpret_cast<const uint8_t *>(islandCode),
+                  sizeof(islandCode)};
+  island->relocs.emplace_back(/*type=*/ARM64_RELOC_BRANCH26,
+                              /*pcrel=*/true, /*length=*/2,
+                              /*offset=*/0, /*addend=*/0,
+                              /*referent=*/funcSym);
+}
 // Just a single direct branch to the target function.
 static constexpr uint32_t icfSafeThunkCode[] = {
     0x14000000, // 08: b    target
@@ -210,6 +226,7 @@ ARM64::ARM64() : ARM64Common(LP64()) {
 
   stubSize = sizeof(stubCode);
   thunkSize = sizeof(thunkCode);
+  islandSize = sizeof(islandCode);
 
   objcStubsFastSize = sizeof(objcStubsFastCode);
   objcStubsFastAlignment = 32;

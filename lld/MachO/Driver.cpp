@@ -1052,6 +1052,25 @@ static ICFLevel getICFLevel(const ArgList &args) {
   return icfLevel;
 }
 
+static BranchRangeExtensionMode
+getBranchRangeExtensionMode(const ArgList &args) {
+  StringRef modeStr = args.getLastArgValue(OPT_branch_range_extension_eq);
+  auto mode = StringSwitch<BranchRangeExtensionMode>(modeStr)
+                  .Cases({"thunks", ""}, BranchRangeExtensionMode::thunks)
+                  .Case("islands-slop-free",
+                        BranchRangeExtensionMode::islandsSlopFree)
+                  .Case("thunk-exact", BranchRangeExtensionMode::thunkExact)
+                  .Case("mold", BranchRangeExtensionMode::mold)
+                  .Case("hybrid", BranchRangeExtensionMode::hybrid)
+                  .Default(BranchRangeExtensionMode::thunks);
+  if (mode == BranchRangeExtensionMode::thunks && !modeStr.empty() &&
+      modeStr != "thunks") {
+    warn(Twine("unknown --branch-range-extension=OPTION `") + modeStr +
+         "', defaulting to `thunks'");
+  }
+  return mode;
+}
+
 static ObjCStubsMode getObjCStubsMode(const ArgList &args) {
   const Arg *arg = args.getLastArg(OPT_objc_stubs_fast, OPT_objc_stubs_small);
   if (!arg)
@@ -2036,6 +2055,7 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
       config->emitChainedFixups || args.hasArg(OPT_init_offsets);
   config->emitRelativeMethodLists = shouldEmitRelativeMethodLists(args);
   config->icfLevel = getICFLevel(args);
+  config->branchRangeExtensionMode = getBranchRangeExtensionMode(args);
   config->keepICFStabs = args.hasArg(OPT_keep_icf_stabs);
   config->dedupStrings =
       args.hasFlag(OPT_deduplicate_strings, OPT_no_deduplicate_strings, true);

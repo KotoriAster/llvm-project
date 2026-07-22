@@ -18,6 +18,8 @@
 
 namespace lld::macho {
 
+enum class BranchRangeExtensionMode;
+
 // Linking multiple files will inevitably mean resolving sections in different
 // files that are labeled with the same segment and section name. This class
 // contains all such sections and writes the data from each section sequentially
@@ -98,7 +100,11 @@ public:
   }
 
 private:
+  void finalizeWithExtenders(BranchRangeExtensionMode);
+
   std::vector<ConcatInputSection *> thunks;
+  bool hybridFinalized = false;
+  uint64_t hybridAddr = 0;
   /// \return true if the target in \p r is in range from the location in \p
   /// isec. If the target isec is not finalized, \return false.
   bool isTargetKnownInRange(const ConcatInputSection &isec,

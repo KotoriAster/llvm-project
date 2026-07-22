@@ -15,6 +15,7 @@ add_lld_library(lldMachO
   Dwarf.cpp
   EhFrame.cpp
   ExportTrie.cpp
+  Finalizer.cpp
   ICF.cpp
   InputFiles.cpp
   InputSection.cpp
