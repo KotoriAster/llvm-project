@@ -16,11 +16,15 @@
 #include "Target.h"
 #include "lld/Common/CommonLinkerContext.h"
 #include "llvm/BinaryFormat/MachO.h"
+#include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/Parallel.h"
 #include "llvm/Support/TimeProfiler.h"
 
 #define DEBUG_TYPE "lld-macho-branch-islands"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <iterator>
 #include <limits>
@@ -75,6 +79,7 @@ static uint64_t addSat(uint64_t va, uint64_t range) {
 namespace {
 constexpr uint32_t noExtender = std::numeric_limits<uint32_t>::max();
 constexpr uint64_t boundarySpacing = 1024 * 1024;
+constexpr uint64_t packingSafetyMargin = 4 * 1024 * 1024;
 
 enum class ExtenderRole : uint8_t { Terminal, Relay, Thunk };
 
@@ -83,26 +88,19 @@ struct ExtensionPolicy {
   // Maximum island depth from the callee.
   uint32_t maxHops;
   bool allowThunk;
+  bool packIslands;
 };
-
-// Immutable per-mode policy table. Each mode maps to a named compile-time
-// constant; the fields are, in order: name, maxHops, allowThunk.
-constexpr ExtensionPolicy moldPolicy = {"mold", 1, true};
-constexpr ExtensionPolicy hybridPolicy = {"hybrid", 2, true};
-constexpr ExtensionPolicy islandsSlopFreePolicy = {"islands-slop-free",
-                                                   noExtender, false};
-constexpr ExtensionPolicy thunkExactPolicy = {"thunk-exact", 0, true};
 
 static constexpr ExtensionPolicy extensionPolicy(BranchRangeExtensionMode mode) {
   switch (mode) {
   case BranchRangeExtensionMode::mold:
-    return moldPolicy;
+    return {"mold", 1, true, false};
   case BranchRangeExtensionMode::hybrid:
-    return hybridPolicy;
+    return {"hybrid", 2, true, false};
   case BranchRangeExtensionMode::islandsSlopFree:
-    return islandsSlopFreePolicy;
+    return {"islands-slop-free", noExtender, false, true};
   case BranchRangeExtensionMode::thunkExact:
-    return thunkExactPolicy;
+    return {"thunk-exact", 0, true, false};
   default:
     llvm_unreachable("invalid unified branch-extension mode");
   }
@@ -144,18 +142,23 @@ struct ExtensionGroup {
   int64_t addend = 0;
   uint32_t targetInputIdx = noExtender;
   uint64_t targetValue = 0;
+  // If a saturated reservation envelope still produces an invalid island
+  // graph, policies that permit thunks permanently fall back for this group.
+  bool forceThunk = false;
+  // Exact-layout contraction can force an otherwise direct branch onto an
+  // extender path. Almost every group keeps this false, allowing planning and
+  // validation to skip its sorted, provably-direct middle range.
+  bool hasForcedExtenders = false;
   SmallVector<ExtensionBranch, 0> branches;
   // Thunk extenders created for this group, kept sorted by bucket (i.e. by
   // candidateVA). A thunk reaches its target in one hop, so any callsite of
   // this group within a thunk's branch range may reuse it. Sharing is scoped
   // to one group because each thunk carries the group's addend.
   SmallVector<uint32_t, 0> thunks;
-};
-
-struct OwnerRun {
-  TextOutputSection *owner = nullptr;
-  uint32_t begin = 0;
-  uint32_t end = 0;
+  // Packing is a placement preference, not a correctness requirement. If an
+  // exact-layout pass saturates with an invalid packed graph, exclude the
+  // offending preferred boundaries for this group.
+  SmallVector<uint32_t, 4> rejectedPackingBuckets;
 };
 
 struct ExtensionState {
@@ -169,35 +172,23 @@ struct ExtensionState {
 
   SmallVector<TextOutputSection *, 4> sections;
   SmallVector<ConcatInputSection *, 0> inputs;
-  SmallVector<OwnerRun, 4> ownerRuns;
-  SmallVector<uint32_t, 0> allBuckets;
-  SmallVector<uint32_t, 0> placementBuckets;
-  std::vector<uint64_t> inputVA;
-  std::vector<uint64_t> candidateVA;
-  std::vector<uint32_t> desiredExtra;
-  std::vector<uint32_t> reservedExtra;
-  std::vector<uint32_t> bucketHead;
-  std::vector<uint32_t> bucketTail;
+  SmallVector<uint32_t, 0> allBuckets, packingBuckets, placementBuckets;
+  std::vector<uint64_t> inputVA, candidateVA;
+  std::vector<uint32_t> desiredExtra, reservedExtra, bucketHead, bucketTail;
   SmallVector<ExtensionNode, 0> extenders;
   SmallVector<ExtensionGroup, 0> groups;
 };
 
 struct ExtensionStats {
-  size_t branchRelocs = 0;
-  size_t islandCalls = 0;
-  size_t chainCalls = 0;
-  size_t thunkCalls = 0;
-  size_t islands = 0;
-  size_t thunks = 0;
-  size_t verifiedBranches = 0;
+  size_t branchRelocs = 0, islandCalls = 0, chainCalls = 0, thunkCalls = 0;
+  size_t islands = 0, thunks = 0, verifiedBranches = 0;
+  size_t islandBuckets = 0, islandPages = 0;
 };
 
 struct InvalidPlanStats {
-  size_t directCalls = 0;
-  size_t extenderCalls = 0;
-  size_t relays = 0;
-  size_t terminals = 0;
+  size_t directCalls = 0, extenderCalls = 0, relays = 0, terminals = 0;
   size_t unresolved = 0;
+  std::vector<uint8_t> islandGroups;
 
   bool empty() const {
     return directCalls == 0 && extenderCalls == 0 && relays == 0 &&
@@ -205,11 +196,27 @@ struct InvalidPlanStats {
   }
 };
 
+struct ProposalStats {
+  size_t islands = 0, thunks = 0, buckets = 0;
+  uint64_t bytes = 0;
+};
+
+struct ReservationGrowthStats {
+  size_t newBuckets = 0, grownBuckets = 0, totalBuckets = 0;
+  uint64_t addedBytes = 0, totalBytes = 0;
+
+  bool grew() const { return newBuckets != 0 || grownBuckets != 0; }
+};
+
 static bool inBranchRange(uint64_t from, uint64_t to) {
   return (target->backwardBranchRange < from
               ? from - target->backwardBranchRange
               : 0) <= to &&
          to <= from + target->forwardBranchRange;
+}
+
+static bool isDTrace(const Symbol *sym) {
+  return sym->getName().starts_with("___dtrace_");
 }
 
 static size_t extenderSize(const ExtensionNode &e) {
@@ -220,8 +227,11 @@ static size_t extenderSize(const ExtensionNode &e) {
 static void collectExtensionBranches(ExtensionState &s) {
   TimeTraceScope timeScope("Branch extension collect");
   DenseMap<ConcatInputSection *, uint32_t> inputIndex;
-  for (uint32_t i = 0; i < s.inputs.size(); ++i)
-    inputIndex[s.inputs[i]] = i;
+  {
+    TimeTraceScope timeScope("Branch extension index inputs");
+    for (uint32_t i = 0; i < s.inputs.size(); ++i)
+      inputIndex[s.inputs[i]] = i;
+  }
 
   DenseMap<IslandKey, uint32_t> groupByKey;
   auto collect = [&](Relocation &r, uint32_t inputIdx) {
@@ -239,42 +249,44 @@ static void collectExtensionBranches(ExtensionState &s) {
       ExtensionGroup &group = s.groups.emplace_back();
       group.target = targetSym;
       group.addend = r.addend;
-      if (!needsBinding(targetSym)) {
-        if (auto *defined = dyn_cast<Defined>(targetSym)) {
-          if (auto *targetIsec =
-                  dyn_cast_or_null<ConcatInputSection>(defined->isec())) {
-            auto targetIt = inputIndex.find(targetIsec);
-            if (targetIt != inputIndex.end()) {
-              group.targetInputIdx = targetIt->second;
-              group.targetValue = defined->value;
-            }
-          }
-        }
+      auto *defined = dyn_cast<Defined>(targetSym);
+      auto *targetIsec =
+          defined && !needsBinding(defined)
+              ? dyn_cast_or_null<ConcatInputSection>(defined->isec())
+              : nullptr;
+      auto targetIt = inputIndex.find(targetIsec);
+      if (targetIt != inputIndex.end()) {
+        group.targetInputIdx = targetIt->second;
+        group.targetValue = defined->value;
       }
     }
     s.groups[it->second].branches.emplace_back(&r, inputIdx);
   };
 
-  for (uint32_t inputIdx = 0; inputIdx < s.inputs.size(); ++inputIdx) {
-    std::vector<Relocation> &relocs = s.inputs[inputIdx]->relocs;
-    if (std::is_sorted(relocs.begin(), relocs.end(),
-                       [](const Relocation &lhs, const Relocation &rhs) {
-                         return lhs.offset > rhs.offset;
-                       })) {
-      for (Relocation &r : llvm::reverse(relocs))
-        collect(r, inputIdx);
-      continue;
-    }
+  {
+    TimeTraceScope timeScope("Branch extension group relocations");
+    for (uint32_t inputIdx = 0; inputIdx < s.inputs.size(); ++inputIdx) {
+      std::vector<Relocation> &relocs = s.inputs[inputIdx]->relocs;
+      if (std::is_sorted(relocs.begin(), relocs.end(),
+                         [](const Relocation &lhs, const Relocation &rhs) {
+                           return lhs.offset > rhs.offset;
+                         })) {
+        for (Relocation &r : llvm::reverse(relocs))
+          collect(r, inputIdx);
+        continue;
+      }
 
-    SmallVector<Relocation *, 0> branches;
-    for (Relocation &r : relocs)
-      if (target->hasAttr(r.type, RelocAttrBits::BRANCH))
-        branches.push_back(&r);
-    llvm::sort(branches, [](const Relocation *lhs, const Relocation *rhs) {
-      return lhs->offset < rhs->offset;
-    });
-    for (Relocation *r : branches)
-      collect(*r, inputIdx);
+      SmallVector<Relocation *, 0> branches;
+      for (Relocation &r : relocs)
+        if (target->hasAttr(r.type, RelocAttrBits::BRANCH))
+          branches.push_back(&r);
+      llvm::sort(branches, [](const Relocation *lhs,
+                             const Relocation *rhs) {
+        return lhs->offset < rhs->offset;
+      });
+      for (Relocation *r : branches)
+        collect(*r, inputIdx);
+    }
   }
 }
 
@@ -283,12 +295,13 @@ static void relayoutExtensions(ExtensionState &s,
   TimeTraceScope timeScope("Branch extension relayout");
   uint64_t addr = s.sections.front()->addr;
   uint64_t groupSize = 0;
-  for (const OwnerRun &run : s.ownerRuns) {
-    groupSize = alignToPowerOf2(groupSize, run.owner->align);
+  uint32_t inputIdx = 0;
+  for (TextOutputSection *owner : s.sections) {
+    groupSize = alignToPowerOf2(groupSize, owner->align);
     uint64_t ownerBase = groupSize;
     uint64_t ownerSize = 0;
-    for (uint32_t i = run.begin; i < run.end; ++i) {
-      ConcatInputSection *isec = s.inputs[i];
+    for (ConcatInputSection *isec : owner->inputs) {
+      uint32_t i = inputIdx++;
       ownerSize = alignToPowerOf2(ownerSize, isec->align);
       s.inputVA[i] = addr + ownerBase + ownerSize;
       ownerSize += isec->getSize();
@@ -326,7 +339,38 @@ static void initializePlacementBuckets(ExtensionState &s) {
   for (uint32_t i = 0; i < s.inputs.size(); ++i)
     s.allBuckets.push_back(i);
 
-  s.placementBuckets.push_back(0);
+  // islands-slop-free first tries globally shared, range-spaced boundaries.
+  // These are preferred coordinates only: no space is reserved at them. Do
+  // not force either endpoint into a preferred set; allBuckets retains both
+  // as exact fallbacks.
+  if (s.policy.packIslands && s.inputs.size() > 2) {
+    uint64_t branchRange =
+        std::min(target->forwardBranchRange, target->backwardBranchRange);
+    if (branchRange > packingSafetyMargin) {
+      uint64_t stride = branchRange - packingSafetyMargin;
+      uint64_t nextVA = addSat(s.candidateVA.front(), stride);
+      while (nextVA < s.candidateVA.back()) {
+        auto it = llvm::lower_bound(s.candidateVA, nextVA);
+        uint32_t bucket = it - s.candidateVA.begin();
+        if (it == s.candidateVA.end() || *it > nextVA) {
+          if (bucket == 0)
+            break;
+          --bucket;
+        }
+        if (bucket != 0 && bucket + 1 < s.inputs.size() &&
+            (s.packingBuckets.empty() ||
+             s.packingBuckets.back() != bucket))
+          s.packingBuckets.push_back(bucket);
+        uint64_t followingVA = addSat(nextVA, stride);
+        if (followingVA == nextVA)
+          break;
+        nextVA = followingVA;
+      }
+    }
+  }
+
+  // Keep the existing ~1 MiB fast search without its former unconditional
+  // first/last entries. The exhaustive layer supplies those endpoints.
   uint64_t lastVA = s.candidateVA.front();
   for (uint32_t i = 1; i + 1 < s.inputs.size(); ++i) {
     if (s.candidateVA[i] - lastVA < boundarySpacing)
@@ -334,8 +378,12 @@ static void initializePlacementBuckets(ExtensionState &s) {
     s.placementBuckets.push_back(i);
     lastVA = s.candidateVA[i];
   }
-  if (s.inputs.size() > 1)
-    s.placementBuckets.push_back(s.inputs.size() - 1);
+}
+
+static bool isRejectedPackingBucket(const ExtensionState &s,
+                                    uint32_t groupIdx, uint32_t bucket) {
+  return llvm::binary_search(s.groups[groupIdx].rejectedPackingBuckets,
+                             bucket);
 }
 
 static std::optional<uint64_t>
@@ -409,10 +457,8 @@ static uint32_t createExtender(ExtensionState &s, uint32_t groupIdx,
     assert(relayTo < s.extenders.size());
     assert(s.extenders[relayTo].role != ExtenderRole::Thunk);
   }
-  uint32_t hopsFromTarget = 0;
-  if (role == ExtenderRole::Terminal)
-    hopsFromTarget = 1;
-  else if (role == ExtenderRole::Relay) {
+  uint32_t hopsFromTarget = role == ExtenderRole::Terminal ? 1 : 0;
+  if (role == ExtenderRole::Relay) {
     assert(s.extenders[relayTo].hopsFromTarget < noExtender);
     hopsFromTarget = s.extenders[relayTo].hopsFromTarget + 1;
   }
@@ -433,18 +479,9 @@ static uint64_t plannedExtenderVA(const ExtensionState &s, size_t bucket) {
   return s.candidateVA[bucket] + s.desiredExtra[bucket];
 }
 
-static TextOutputSection *ownerForInput(const ExtensionState &s,
-                                        uint32_t inputIdx) {
-  auto it = llvm::upper_bound(
-      s.ownerRuns, inputIdx,
-      [](uint32_t index, const OwnerRun &run) { return index < run.end; });
-  assert(it != s.ownerRuns.end() && it->begin <= inputIdx);
-  return it->owner;
-}
-
 static std::optional<size_t>
 findExtenderBoundary(ExtensionState &s, ArrayRef<uint32_t> buckets,
-                     uint64_t callVA, uint64_t anchorVA) {
+                     uint64_t callVA, uint64_t anchorVA, uint32_t groupIdx) {
   if (callVA < anchorVA) {
     uint64_t afterCall =
         callVA == std::numeric_limits<uint64_t>::max() ? callVA : callVA + 1;
@@ -458,6 +495,10 @@ findExtenderBoundary(ExtensionState &s, ArrayRef<uint32_t> buckets,
     while (it != buckets.end() && s.candidateVA[*it] < anchorVA) {
       ++s.boundaryProbes;
       size_t bucket = *it;
+      if (isRejectedPackingBucket(s, groupIdx, bucket)) {
+        ++it;
+        continue;
+      }
       uint64_t va = plannedExtenderVA(s, bucket);
       if (callVA < va && va < anchorVA && inBranchRange(va, anchorVA))
         return bucket;
@@ -481,6 +522,8 @@ findExtenderBoundary(ExtensionState &s, ArrayRef<uint32_t> buckets,
       break;
     ++s.boundaryProbes;
     size_t bucket = *it;
+    if (isRejectedPackingBucket(s, groupIdx, bucket))
+      continue;
     uint64_t va = plannedExtenderVA(s, bucket);
     if (anchorVA < va && va < callVA && inBranchRange(va, anchorVA))
       return bucket;
@@ -489,11 +532,16 @@ findExtenderBoundary(ExtensionState &s, ArrayRef<uint32_t> buckets,
 }
 
 static std::optional<size_t>
-findExtenderBoundary(ExtensionState &s, uint64_t callVA, uint64_t anchorVA) {
-  if (auto bucket =
-          findExtenderBoundary(s, s.placementBuckets, callVA, anchorVA))
+findExtenderBoundary(ExtensionState &s, uint64_t callVA, uint64_t anchorVA,
+                     uint32_t groupIdx) {
+  if (s.policy.packIslands)
+    if (auto bucket = findExtenderBoundary(
+            s, s.packingBuckets, callVA, anchorVA, groupIdx))
+      return bucket;
+  if (auto bucket = findExtenderBoundary(
+          s, s.placementBuckets, callVA, anchorVA, groupIdx))
     return bucket;
-  return findExtenderBoundary(s, s.allBuckets, callVA, anchorVA);
+  return findExtenderBoundary(s, s.allBuckets, callVA, anchorVA, groupIdx);
 }
 
 static uint32_t extendExtenderSpine(ExtensionState &s, uint32_t groupIdx,
@@ -513,7 +561,8 @@ static uint32_t extendExtenderSpine(ExtensionState &s, uint32_t groupIdx,
   SmallVector<size_t, 4> buckets;
   while (hopsFromTarget != s.policy.maxHops &&
          !inBranchRange(callVA, anchorVA)) {
-    std::optional<size_t> bucket = findExtenderBoundary(s, callVA, anchorVA);
+    std::optional<size_t> bucket =
+        findExtenderBoundary(s, callVA, anchorVA, groupIdx);
     if (!bucket)
       return noExtender;
     buckets.push_back(*bucket);
@@ -668,10 +717,27 @@ static uint64_t branchVA(const ExtensionState &s,
   return s.inputVA[branch.inputIdx] + branch.reloc->offset;
 }
 
+template <class StateT, class GroupT>
+static auto directBranchBounds(StateT &s, GroupT &group, uint64_t targetVA) {
+  uint64_t firstDirectVA = subSat(targetVA, target->forwardBranchRange);
+  uint64_t pastDirectVA = addSat(targetVA, target->backwardBranchRange);
+  auto first = llvm::lower_bound(
+      group.branches, firstDirectVA,
+      [&](const ExtensionBranch &branch, uint64_t va) {
+        return branchVA(s, branch) < va;
+      });
+  auto last = llvm::upper_bound(
+      group.branches, pastDirectVA,
+      [&](uint64_t va, const ExtensionBranch &branch) {
+        return va < branchVA(s, branch);
+      });
+  return std::make_pair(first, last);
+}
+
 static void planGroup(ExtensionState &s, uint32_t groupIdx) {
   ExtensionGroup &group = s.groups[groupIdx];
   std::optional<uint64_t> targetVA = extensionTargetVA(s, group);
-  if (!targetVA) {
+  if (!targetVA || group.forceThunk) {
     if (!s.policy.allowThunk) {
       error("cannot resolve island-only branch target " +
             toString(*group.target));
@@ -680,35 +746,43 @@ static void planGroup(ExtensionState &s, uint32_t groupIdx) {
       return;
     }
     for (ExtensionBranch &branch : group.branches) {
-      uint64_t callVA = s.inputVA[branch.inputIdx] + branch.reloc->offset;
-      branch.extender = placeThunk(s, groupIdx, callVA);
+      if (targetVA && !branch.forceExtender &&
+          inBranchRange(branchVA(s, branch), *targetVA)) {
+        branch.extender = noExtender;
+        continue;
+      }
+      branch.extender = placeThunk(s, groupIdx, branchVA(s, branch));
     }
     return;
   }
 
-  // Sweep away from the target on each side. planBranch filters genuinely
-  // direct branches while retaining any branch that an earlier exact proposal
-  // promoted out of the conservative envelope's direct set.
-  auto targetSplit = std::lower_bound(
-      group.branches.begin(), group.branches.end(), *targetVA,
-      [&](const ExtensionBranch &branch, uint64_t va) {
-        return branchVA(s, branch) < va;
-      });
+  // Sweep only the out-of-range tails. Branches are sorted by address, so the
+  // potentially very large middle interval is known to be direct without
+  // visiting every relocation again on every fixed-point pass.
+  auto [firstDirect, lastDirect] = directBranchBounds(s, group, *targetVA);
+  if (group.hasForcedExtenders) {
+    firstDirect = lastDirect = llvm::lower_bound(
+        group.branches, *targetVA,
+        [&](const ExtensionBranch &branch, uint64_t va) {
+          return branchVA(s, branch) < va;
+        });
+  }
   uint32_t lowerIsland = noExtender;
-  for (auto it = std::make_reverse_iterator(targetSplit);
+  for (auto it = std::make_reverse_iterator(firstDirect);
        it != group.branches.rend(); ++it)
     planBranch(s, groupIdx, *it, *targetVA, lowerIsland);
   uint32_t upperIsland = noExtender;
-  for (auto it = targetSplit; it != group.branches.end(); ++it)
+  for (auto it = lastDirect; it != group.branches.end(); ++it)
     planBranch(s, groupIdx, *it, *targetVA, upperIsland);
 }
 
 static InvalidPlanStats validateExtensionPlan(const ExtensionState &s) {
   InvalidPlanStats invalid;
-  SmallVector<std::optional<uint64_t>, 0> targetVAs;
-  targetVAs.reserve(s.groups.size());
-  for (const ExtensionGroup &group : s.groups)
-    targetVAs.push_back(extensionTargetVA(s, group));
+  invalid.islandGroups.resize(s.groups.size());
+  std::vector<std::optional<uint64_t>> targetVAs(s.groups.size());
+  parallelFor(0, s.groups.size(), [&](size_t groupIdx) {
+    targetVAs[groupIdx] = extensionTargetVA(s, s.groups[groupIdx]);
+  });
 
   for (const ExtensionNode &extender : s.extenders) {
     if (extender.role == ExtenderRole::Thunk)
@@ -716,39 +790,76 @@ static InvalidPlanStats validateExtensionPlan(const ExtensionState &s) {
     if (extender.role == ExtenderRole::Relay) {
       if (extender.relayTo >= s.extenders.size() ||
           !inBranchRange(extender.layoutVA,
-                         s.extenders[extender.relayTo].layoutVA))
+                         s.extenders[extender.relayTo].layoutVA)) {
         ++invalid.relays;
+        invalid.islandGroups[extender.group] = true;
+      }
       continue;
     }
     std::optional<uint64_t> targetVA = targetVAs[extender.group];
     if (!targetVA) {
-      if (!s.groups[extender.group].target->getName().starts_with(
-              "___dtrace_"))
+      if (!isDTrace(s.groups[extender.group].target)) {
         ++invalid.unresolved;
+        invalid.islandGroups[extender.group] = true;
+      }
       continue;
     }
-    if (!inBranchRange(extender.layoutVA, *targetVA))
+    if (!inBranchRange(extender.layoutVA, *targetVA)) {
       ++invalid.terminals;
+      invalid.islandGroups[extender.group] = true;
+    }
   }
 
-  for (size_t groupIdx = 0; groupIdx < s.groups.size(); ++groupIdx) {
-    const ExtensionGroup &group = s.groups[groupIdx];
-    for (const ExtensionBranch &branch : group.branches) {
-      if (branch.extender != noExtender) {
-        if (branch.extender >= s.extenders.size() ||
-            !inBranchRange(branchVA(s, branch),
-                           s.extenders[branch.extender].layoutVA))
-          ++invalid.extenderCalls;
+  struct alignas(64) ValidationShard {
+    size_t directCalls = 0;
+    size_t extenderCalls = 0;
+    size_t unresolved = 0;
+  };
+  constexpr size_t shardCount = 256;
+  std::array<ValidationShard, shardCount> shards;
+  parallelFor(0, shardCount, [&](size_t shardIdx) {
+    size_t begin = s.groups.size() * shardIdx / shardCount;
+    size_t end = s.groups.size() * (shardIdx + 1) / shardCount;
+    ValidationShard &shard = shards[shardIdx];
+    for (size_t groupIdx = begin; groupIdx < end; ++groupIdx) {
+      const ExtensionGroup &group = s.groups[groupIdx];
+      auto validate = [&](const ExtensionBranch &branch) {
+        if (branch.extender != noExtender) {
+          if (branch.extender >= s.extenders.size() ||
+              !inBranchRange(branchVA(s, branch),
+                             s.extenders[branch.extender].layoutVA)) {
+            ++shard.extenderCalls;
+            if (branch.extender >= s.extenders.size() ||
+                s.extenders[branch.extender].role != ExtenderRole::Thunk)
+              invalid.islandGroups[groupIdx] = true;
+          }
+          return;
+        }
+        if (!targetVAs[groupIdx]) {
+          if (!isDTrace(group.target))
+            ++shard.unresolved;
+          return;
+        }
+        if (!inBranchRange(branchVA(s, branch), *targetVAs[groupIdx]))
+          ++shard.directCalls;
+      };
+      if (!targetVAs[groupIdx] || group.hasForcedExtenders) {
+        for (const ExtensionBranch &branch : group.branches)
+          validate(branch);
         continue;
       }
-      if (!targetVAs[groupIdx]) {
-        if (!group.target->getName().starts_with("___dtrace_"))
-          ++invalid.unresolved;
-        continue;
-      }
-      if (!inBranchRange(branchVA(s, branch), *targetVAs[groupIdx]))
-        ++invalid.directCalls;
+      auto [firstDirect, lastDirect] =
+          directBranchBounds(s, group, *targetVAs[groupIdx]);
+      for (auto it = group.branches.begin(); it != firstDirect; ++it)
+        validate(*it);
+      for (auto it = lastDirect; it != group.branches.end(); ++it)
+        validate(*it);
     }
+  });
+  for (const ValidationShard &shard : shards) {
+    invalid.directCalls += shard.directCalls;
+    invalid.extenderCalls += shard.extenderCalls;
+    invalid.unresolved += shard.unresolved;
   }
   return invalid;
 }
@@ -770,10 +881,106 @@ static size_t forceInvalidDirectBranches(ExtensionState &s) {
           branch.forceExtender)
         continue;
       branch.forceExtender = true;
+      group.hasForcedExtenders = true;
       ++promoted;
     }
   }
   return promoted;
+}
+
+static size_t forceInvalidIslandGroups(ExtensionState &s,
+                                       const InvalidPlanStats &invalid) {
+  if (!s.policy.allowThunk)
+    return 0;
+
+  size_t forced = 0;
+  for (size_t groupIdx = 0; groupIdx < s.groups.size(); ++groupIdx) {
+    ExtensionGroup &group = s.groups[groupIdx];
+    if (!invalid.islandGroups[groupIdx] || group.forceThunk)
+      continue;
+    group.forceThunk = true;
+    if (forced < 8)
+      log(s.policy.name + " branch extender forcing thunk fallback for " +
+          toString(*group.target));
+    ++forced;
+  }
+  return forced;
+}
+
+static size_t invalidIslandGroupCount(const InvalidPlanStats &invalid) {
+  return llvm::count(invalid.islandGroups, uint8_t(1));
+}
+
+static size_t rejectInvalidPackingBuckets(ExtensionState &s,
+                                          const InvalidPlanStats &invalid) {
+  if (!s.policy.packIslands || s.packingBuckets.empty())
+    return 0;
+
+  size_t rejected = 0;
+  for (const ExtensionNode &extender : s.extenders) {
+    if (extender.role == ExtenderRole::Thunk ||
+        !invalid.islandGroups[extender.group] ||
+        !llvm::binary_search(s.packingBuckets, extender.bucket))
+      continue;
+    auto &buckets = s.groups[extender.group].rejectedPackingBuckets;
+    if (llvm::is_contained(buckets, extender.bucket))
+      continue;
+    buckets.push_back(extender.bucket);
+    ++rejected;
+  }
+  for (ExtensionGroup &group : s.groups)
+    llvm::sort(group.rejectedPackingBuckets);
+  return rejected;
+}
+
+static void resetExtensionPlan(ExtensionState &s) {
+  s.extenders.clear();
+  std::fill(s.desiredExtra.begin(), s.desiredExtra.end(), 0);
+  std::fill(s.bucketHead.begin(), s.bucketHead.end(), noExtender);
+  std::fill(s.bucketTail.begin(), s.bucketTail.end(), noExtender);
+  for (ExtensionGroup &group : s.groups) {
+    group.thunks.clear();
+    for (ExtensionBranch &branch : group.branches)
+      branch.extender = noExtender;
+  }
+}
+
+static ProposalStats summarizeProposal(const ExtensionState &s) {
+  ProposalStats stats;
+  for (const ExtensionNode &extender : s.extenders) {
+    if (extender.role == ExtenderRole::Thunk)
+      ++stats.thunks;
+    else
+      ++stats.islands;
+  }
+  for (uint32_t bytes : s.desiredExtra) {
+    if (bytes == 0)
+      continue;
+    ++stats.buckets;
+    stats.bytes += bytes;
+  }
+  return stats;
+}
+
+static ReservationGrowthStats growReservation(ExtensionState &s) {
+  ReservationGrowthStats stats;
+  for (size_t i = 0; i != s.reservedExtra.size(); ++i) {
+    uint32_t oldBytes = s.reservedExtra[i];
+    uint32_t desiredBytes = s.desiredExtra[i];
+    if (oldBytes < desiredBytes) {
+      if (oldBytes == 0)
+        ++stats.newBuckets;
+      else
+        ++stats.grownBuckets;
+      stats.addedBytes += desiredBytes - oldBytes;
+      s.reservedExtra[i] = desiredBytes;
+    }
+    if (s.reservedExtra[i] != 0) {
+      ++stats.totalBuckets;
+      stats.totalBytes += s.reservedExtra[i];
+    }
+  }
+  return stats;
 }
 
 static bool runExtensionFixedPoint(ExtensionState &s) {
@@ -782,50 +989,92 @@ static bool runExtensionFixedPoint(ExtensionState &s) {
   relayoutExtensions(s, s.reservedExtra);
   initializePlacementBuckets(s);
   for (s.passes = 1; s.passes <= maxPasses; ++s.passes) {
-    s.extenders.clear();
-    std::fill(s.desiredExtra.begin(), s.desiredExtra.end(), 0);
-    std::fill(s.bucketHead.begin(), s.bucketHead.end(), noExtender);
-    std::fill(s.bucketTail.begin(), s.bucketTail.end(), noExtender);
-    for (ExtensionGroup &group : s.groups) {
-      group.thunks.clear();
-      for (ExtensionBranch &branch : group.branches)
-        branch.extender = noExtender;
+    auto passStart = std::chrono::steady_clock::now();
+    size_t probesBefore = s.boundaryProbes;
+    {
+      TimeTraceScope timeScope("Branch extension plan");
+      resetExtensionPlan(s);
+      for (uint32_t groupIdx = 0; groupIdx < s.groups.size(); ++groupIdx)
+        planGroup(s, groupIdx);
     }
-    for (uint32_t groupIdx = 0; groupIdx < s.groups.size(); ++groupIdx)
-      planGroup(s, groupIdx);
 
     relayoutExtensions(s);
-    log(s.policy.name + " branch extender pass " +
-        std::to_string(s.passes) + ": proposed extenders = " +
-        std::to_string(s.extenders.size()));
-    InvalidPlanStats invalid = validateExtensionPlan(s);
+    InvalidPlanStats invalid;
+    {
+      TimeTraceScope timeScope("Branch extension validate");
+      invalid = validateExtensionPlan(s);
+    }
+    if (errorHandler().verbose) {
+      ProposalStats proposal = summarizeProposal(s);
+      auto passMillis = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - passStart)
+                            .count();
+      log(formatv("{0} branch extender pass {1}: time = {2} ms, proposed "
+                  "extenders = {3}, islands = {4}, thunks = {5}, proposal "
+                  "buckets = {6}, proposal bytes = {7}, boundary probes = {8}",
+                  s.policy.name, s.passes, passMillis, s.extenders.size(),
+                  proposal.islands, proposal.thunks, proposal.buckets,
+                  proposal.bytes, s.boundaryProbes - probesBefore)
+              .str());
+    }
     if (invalid.empty())
       return true;
-    log(s.policy.name + " branch extender invalid plan: direct calls = " +
-        std::to_string(invalid.directCalls) +
-        ", extender calls = " + std::to_string(invalid.extenderCalls) +
-        ", relays = " + std::to_string(invalid.relays) +
-        ", terminals = " + std::to_string(invalid.terminals) +
-        ", unresolved = " + std::to_string(invalid.unresolved));
-    bool grew = false;
-    for (size_t i = 0; i < s.reservedExtra.size(); ++i) {
-      if (s.reservedExtra[i] >= s.desiredExtra[i])
-        continue;
-      s.reservedExtra[i] = s.desiredExtra[i];
-      grew = true;
+    log(formatv("{0} branch extender invalid plan: direct calls = {1}, "
+                "extender calls = {2}, relays = {3}, terminals = {4}, "
+                "unresolved = {5}",
+                s.policy.name, invalid.directCalls, invalid.extenderCalls,
+                invalid.relays, invalid.terminals, invalid.unresolved)
+            .str());
+    ReservationGrowthStats growth;
+    {
+      TimeTraceScope timeScope("Branch extension converge");
+      growth = growReservation(s);
     }
-    if (!grew) {
+    log(formatv("{0} branch extender reservation growth: new buckets = {1}, "
+                "grown buckets = {2}, added bytes = {3}, total buckets = {4}, "
+                "total bytes = {5}",
+                s.policy.name, growth.newBuckets, growth.grownBuckets,
+                growth.addedBytes, growth.totalBuckets, growth.totalBytes)
+            .str());
+    bool madeProgress = growth.grew();
+    // A single bad island group at the tail of hybrid convergence otherwise
+    // makes every subsequent pass rescan the complete branch graph while a
+    // few unrelated reservation bytes settle. Hybrid is explicitly allowed
+    // to use a thunk for this case, and forceInvalidIslandGroups is the same
+    // fallback used after reservation growth stops. Apply it as soon as the
+    // exact plan's only remaining failure is one island group.
+    if (s.policy.allowThunk && invalid.directCalls == 0 &&
+        invalid.extenderCalls == 0 && invalid.unresolved == 0 &&
+        invalidIslandGroupCount(invalid) == 1) {
+      size_t forced = forceInvalidIslandGroups(s, invalid);
+      if (forced != 0)
+        madeProgress = true;
+    }
+    if (!madeProgress) {
       size_t promoted = forceInvalidDirectBranches(s);
       if (promoted != 0) {
         log(s.policy.name + " branch extender promoted direct calls = " +
-            std::to_string(promoted));
-        grew = true;
+                  std::to_string(promoted));
+        madeProgress = true;
+      }
+      size_t rejected = rejectInvalidPackingBuckets(s, invalid);
+      if (rejected != 0) {
+        log(s.policy.name + " branch extender rejected packed buckets = " +
+            std::to_string(rejected));
+        madeProgress = true;
+      }
+      size_t forced = forceInvalidIslandGroups(s, invalid);
+      if (forced != 0) {
+        log(s.policy.name + " branch extender forced thunk groups = " +
+            std::to_string(forced));
+        madeProgress = true;
       }
     }
-    if (!grew)
+    if (!madeProgress)
       return false;
     relayoutExtensions(s, s.reservedExtra);
   }
+  s.passes = maxPasses;
   return false;
 }
 
@@ -833,7 +1082,7 @@ static void materializeExtenders(ExtensionState &s) {
   TimeTraceScope timeScope("Branch extension materialize");
   size_t sequence = 0;
   for (ExtensionNode &extender : s.extenders) {
-    TextOutputSection *owner = ownerForInput(s, extender.bucket);
+    auto *owner = cast<TextOutputSection>(s.inputs[extender.bucket]->parent);
     extender.isec =
         makeSyntheticInputSection(owner->inputs.front()->getSegName(),
                                   owner->inputs.front()->getName());
@@ -901,7 +1150,7 @@ static void rewriteBranches(ExtensionState &s) {
 
 static void verifyEdge(const ExtensionState &s, uint64_t fromVA, Symbol *sym,
                        int64_t addend, StringRef what, ExtensionStats &stats) {
-  if (sym->getName().starts_with("___dtrace_"))
+  if (isDTrace(sym))
     return;
   std::optional<uint64_t> toVA = nonLocalTargetVA(s, sym, addend);
   if (!toVA)
@@ -920,16 +1169,28 @@ static void verifyEdge(const ExtensionState &s, uint64_t fromVA, Symbol *sym,
 
 static ExtensionStats verifyPlan(const ExtensionState &s) {
   ExtensionStats stats;
+  SmallVector<uint32_t, 0> islandBuckets;
+  SmallVector<uint64_t, 0> islandPages;
+  uint64_t pageSize = target->getPageSize();
   for (const ExtensionNode &extender : s.extenders) {
     if (extender.role == ExtenderRole::Thunk) {
       ++stats.thunks;
       continue;
     }
     ++stats.islands;
+    islandBuckets.push_back(extender.bucket);
+    uint64_t begin = extender.isec->getVA();
+    uint64_t end = begin + extender.isec->getSize() - 1;
+    for (uint64_t page = begin / pageSize; page <= end / pageSize; ++page)
+      islandPages.push_back(page);
     Relocation &r = extender.isec->relocs[0];
     verifyEdge(s, extender.isec->getVA(), cast<Symbol *>(r.referent), r.addend,
                "island", stats);
   }
+  llvm::sort(islandBuckets);
+  stats.islandBuckets = llvm::unique(islandBuckets) - islandBuckets.begin();
+  llvm::sort(islandPages);
+  stats.islandPages = llvm::unique(islandPages) - islandPages.begin();
 
   for (const ExtensionGroup &group : s.groups) {
     stats.branchRelocs += group.branches.size();
@@ -979,13 +1240,9 @@ void TextOutputSection::finalizeWithExtenders(BranchRangeExtensionMode mode) {
 
   {
     TimeTraceScope timeScope("Chain gather inputs");
-    for (TextOutputSection *osec : state.sections) {
-      uint32_t begin = state.inputs.size();
+    for (TextOutputSection *osec : state.sections)
       for (ConcatInputSection *isec : osec->inputs)
         state.inputs.push_back(isec);
-      state.ownerRuns.push_back(
-          {osec, begin, static_cast<uint32_t>(state.inputs.size())});
-    }
   }
 
   if (state.inputs.size() >= noExtender)
@@ -998,7 +1255,8 @@ void TextOutputSection::finalizeWithExtenders(BranchRangeExtensionMode mode) {
   state.bucketTail.assign(state.inputs.size(), noExtender);
   collectExtensionBranches(state);
   if (!runExtensionFixedPoint(state))
-    fatal(state.policy.name + " branch extender did not converge after 30 passes");
+    fatal(state.policy.name + " branch extender did not converge after " +
+          std::to_string(state.passes) + " passes");
 
   materializeExtenders(state);
   rewriteBranches(state);
@@ -1006,8 +1264,8 @@ void TextOutputSection::finalizeWithExtenders(BranchRangeExtensionMode mode) {
   {
     TimeTraceScope timeScope("Chain layout");
     uint64_t groupSize = 0;
-    for (const OwnerRun &run : state.ownerRuns) {
-      TextOutputSection *osec = run.owner;
+    uint32_t inputIdx = 0;
+    for (TextOutputSection *osec : state.sections) {
       groupSize = alignToPowerOf2(groupSize, osec->align);
       osec->hybridAddr = addr + groupSize;
       osec->addr = osec->hybridAddr;
@@ -1017,9 +1275,10 @@ void TextOutputSection::finalizeWithExtenders(BranchRangeExtensionMode mode) {
         osec->finalizeOne(isec);
         groupSize = osec->hybridAddr - addr + osec->size;
       };
-      for (uint32_t inputIdx = run.begin; inputIdx < run.end; ++inputIdx) {
-        finalize(state.inputs[inputIdx]);
-        for (uint32_t extenderIdx = state.bucketHead[inputIdx];
+      for (ConcatInputSection *isec : osec->inputs) {
+        uint32_t i = inputIdx++;
+        finalize(isec);
+        for (uint32_t extenderIdx = state.bucketHead[i];
              extenderIdx != noExtender;
              extenderIdx = state.extenders[extenderIdx].nextInBucket) {
           ExtensionNode &extender = state.extenders[extenderIdx];
@@ -1030,20 +1289,25 @@ void TextOutputSection::finalizeWithExtenders(BranchRangeExtensionMode mode) {
     }
   }
 
-  ExtensionStats stats = verifyPlan(state);
-  log(state.policy.name + " branch extender for " + parent->name + "," + name +
-      ": passes = " + std::to_string(state.passes) +
-      ", branch relocs = " + std::to_string(stats.branchRelocs) +
-      ", island calls = " + std::to_string(stats.islandCalls) +
-      ", chain calls = " + std::to_string(stats.chainCalls) +
-      ", thunk calls = " + std::to_string(stats.thunkCalls) +
-      ", islands = " + std::to_string(stats.islands) +
-      ", thunks = " + std::to_string(stats.thunks) +
-      ", verified branch26 = " + std::to_string(stats.verifiedBranches) +
-      ", boundary probes = " + std::to_string(state.boundaryProbes) +
-      ", inputs = " + std::to_string(state.inputs.size()) +
-      ", targets = " + std::to_string(state.groups.size()) +
-      ", total extenders = " + std::to_string(state.extenders.size()));
+  // runExtensionFixedPoint already validates the exact proposed layout.
+  // Rewalking every branch after materialization is a useful diagnostic audit
+  // but duplicates tens of millions of range checks in normal links.
+  if (errorHandler().verbose) {
+    TimeTraceScope timeScope("Branch extension verify");
+    ExtensionStats stats = verifyPlan(state);
+    log(formatv("{0} branch extender for {1},{2}: passes = {3}, branch relocs = "
+                "{4}, island calls = {5}, chain calls = {6}, thunk calls = {7}, "
+                "islands = {8}, thunks = {9}, verified branch26 = {10}, "
+                "boundary probes = {11}, inputs = {12}, targets = {13}, total "
+                "extenders = {14}, island buckets = {15}, island pages = {16}",
+                state.policy.name, parent->name, name, state.passes,
+                stats.branchRelocs, stats.islandCalls, stats.chainCalls,
+                stats.thunkCalls, stats.islands, stats.thunks,
+                stats.verifiedBranches, state.boundaryProbes,
+                state.inputs.size(), state.groups.size(), state.extenders.size(),
+                stats.islandBuckets, stats.islandPages)
+            .str());
+  }
 
   for (TextOutputSection *osec : state.sections) {
     osec->addr = osec->hybridAddr;
