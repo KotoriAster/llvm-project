@@ -2,6 +2,8 @@
 # RUN: llvm-mc -filetype=obj -triple=x86_64-apple-darwin %s -o %t.o
 
 # RUN: not %lld --read-workers=1 %t.o -o /dev/null
+# RUN: not %lld --input-load-demo=ios %t.o -o /dev/null
+# RUN: not %lld --input-load-workers=1 %t.o -o /dev/null
 
 # CHECK: error: --read-workers=: option unavailable because lld was built without thread support
 

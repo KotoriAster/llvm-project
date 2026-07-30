@@ -59,4 +59,5 @@ settings. For Bazel, this can be done with ``--linkopt`` or with
 .. toctree::
    :hidden:
 
+   InputLoading
    ld64-vs-lld

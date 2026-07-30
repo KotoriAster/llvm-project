@@ -78,6 +78,13 @@ enum class ObjCStubsMode {
   small,
 };
 
+enum class InputLoadDemo {
+  none,
+  iosLd64,
+  elfLld,
+  ldPrime,
+};
+
 struct SectionAlign {
   llvm::StringRef segName;
   llvm::StringRef sectName;
@@ -187,6 +194,9 @@ struct Configuration {
   bool interposable = false;
   bool errorForArchMismatch = false;
   bool ignoreAutoLink = false;
+  InputLoadDemo inputLoadDemo = InputLoadDemo::none;
+  bool inputLoadStats = false;
+  unsigned inputLoadWorkers = 0;
   int readWorkers = 0;
   // ld64 allows invalid auto link options as long as the link succeeds. LLD
   // does not, but there are cases in the wild where the invalid linker options

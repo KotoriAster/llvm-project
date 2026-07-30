@@ -312,7 +312,8 @@ class BitcodeFile final : public InputFile {
 public:
   explicit BitcodeFile(MemoryBufferRef mb, StringRef archiveName,
                        uint64_t offsetInArchive, bool lazy = false,
-                       bool forceHidden = false, bool compatArch = true);
+                       bool forceHidden = false, bool compatArch = true,
+                       std::unique_ptr<llvm::lto::InputFile> obj = nullptr);
   static bool classof(const InputFile *f) { return f->kind() == BitcodeKind; }
   void parse();
 
@@ -328,6 +329,11 @@ extern llvm::DenseMap<llvm::CachedHashStringRef, MemoryBufferRef> cachedReads;
 extern llvm::SmallVector<StringRef> unprocessedLCLinkerOptions;
 
 std::optional<MemoryBufferRef> readFile(StringRef path);
+// Takes ownership of an already-opened file. The cache update, fat slice
+// selection, diagnostics, and reproducer writes still happen on the ordered
+// linker thread.
+std::optional<MemoryBufferRef>
+readFile(StringRef path, std::unique_ptr<llvm::MemoryBuffer> mb);
 
 void extract(InputFile &file, StringRef reason);
 

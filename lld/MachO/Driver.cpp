@@ -49,6 +49,7 @@
 #include "llvm/Support/Process.h"
 #include "llvm/Support/TarWriter.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/ThreadPool.h"
 #include "llvm/Support/Threading.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/TargetParser/Host.h"
@@ -58,6 +59,10 @@
 #if !_WIN32
 #include <sys/mman.h>
 #endif
+
+#include <algorithm>
+#include <atomic>
+#include <system_error>
 
 using namespace llvm;
 using namespace llvm::MachO;
@@ -293,7 +298,7 @@ static void saveThinArchiveToRepro(ArchiveFile const *file) {
 struct DeferredFile {
   StringRef path;
   bool isLazy;
-  MemoryBufferRef buffer;
+  std::optional<MemoryBufferRef> buffer;
   LoadType loadType = LoadType::CommandLine;
   bool isNeeded = false;
   bool isWeak = false;
@@ -360,7 +365,9 @@ void multiThreadedPageInBackground(DeferredFiles &deferred) {
 #endif
 
   auto preloadDeferredFile = [&](const DeferredFile &deferredFile) {
-    const StringRef &buff = deferredFile.buffer.getBuffer();
+    if (!deferredFile.buffer)
+      return;
+    const StringRef &buff = deferredFile.buffer->getBuffer();
     if (buff.size() > largeArchive)
       return;
 
@@ -421,7 +428,11 @@ static InputFile *processFile(std::optional<MemoryBufferRef> buffer,
                               LoadType loadType, bool isLazy = false,
                               bool isExplicit = true,
                               bool isBundleLoader = false,
-                              bool isForceHidden = false) {
+                              bool isForceHidden = false,
+                              std::unique_ptr<object::Archive> preparedArchive =
+                                  nullptr,
+                              std::unique_ptr<lto::InputFile> preparedBitcode =
+                                  nullptr) {
   if (!buffer)
     return nullptr;
   MemoryBufferRef mbref = *buffer;
@@ -442,8 +453,11 @@ static InputFile *processFile(std::optional<MemoryBufferRef> buffer,
     ArchiveFile *file;
     if (entry == loadedArchives.end()) {
       // No cached archive, we need to create a new one
-      std::unique_ptr<object::Archive> archive = CHECK(
-          object::Archive::create(mbref), path + ": failed to parse archive");
+      std::unique_ptr<object::Archive> archive =
+          preparedArchive
+              ? std::move(preparedArchive)
+              : CHECK(object::Archive::create(mbref),
+                      path + ": failed to parse archive");
 
       file = make<ArchiveFile>(std::move(archive), isForceHidden);
 
@@ -544,7 +558,9 @@ static InputFile *processFile(std::optional<MemoryBufferRef> buffer,
       newFile = dylibFile;
     break;
   case file_magic::bitcode:
-    newFile = make<BitcodeFile>(mbref, "", 0, isLazy);
+    newFile = make<BitcodeFile>(mbref, "", 0, isLazy, /*forceHidden=*/false,
+                                /*compatArch=*/true,
+                                std::move(preparedBitcode));
     break;
   case file_magic::macho_executable:
   case file_magic::macho_bundle:
@@ -608,15 +624,298 @@ static void checkAndCacheFramework(InputFile *file, StringRef path) {
   }
 }
 
+#if LLVM_ENABLE_THREADS
+struct PreparedInput {
+  std::unique_ptr<object::Archive> archive;
+  std::unique_ptr<lto::InputFile> bitcode;
+};
+using PreparedInputs = std::vector<PreparedInput>;
+
+static unsigned inputLoadWorkerCount();
+
+class InputLoadStats {
+public:
+  void beginTask() {
+    if (!config->inputLoadStats)
+      return;
+    ++scheduled;
+    unsigned now = active.fetch_add(1, std::memory_order_relaxed) + 1;
+    unsigned oldPeak = peak.load(std::memory_order_relaxed);
+    while (oldPeak < now &&
+           !peak.compare_exchange_weak(oldPeak, now,
+                                       std::memory_order_relaxed))
+      ;
+  }
+
+  void mapped(uint64_t size) {
+    if (!config->inputLoadStats)
+      return;
+    ++mappedFiles;
+    mappedBytes.fetch_add(size, std::memory_order_relaxed);
+  }
+
+  void endTask() {
+    if (!config->inputLoadStats)
+      return;
+    active.fetch_sub(1, std::memory_order_relaxed);
+    ++completed;
+  }
+
+  void print() const {
+    if (!config->inputLoadStats)
+      return;
+    StringRef mode =
+        config->inputLoadDemo == InputLoadDemo::iosLd64
+            ? "ios"
+            : config->inputLoadDemo == InputLoadDemo::elfLld ? "elf"
+                                                             : "prime";
+    message("input-load-stats: mode=" + mode +
+            " workers=" + Twine(inputLoadWorkerCount()) +
+            " tasks=" + Twine(scheduled.load()) +
+            " completed=" + Twine(completed.load()) +
+            " peak-active=" + Twine(peak.load()) +
+            " mapped-files=" + Twine(mappedFiles.load()) +
+            " mapped-bytes=" + Twine(mappedBytes.load()));
+  }
+
+private:
+  std::atomic<unsigned> active{0};
+  std::atomic<unsigned> peak{0};
+  std::atomic<unsigned> scheduled{0};
+  std::atomic<unsigned> completed{0};
+  std::atomic<unsigned> mappedFiles{0};
+  std::atomic<uint64_t> mappedBytes{0};
+};
+
+class InputLoadTaskStats {
+public:
+  explicit InputLoadTaskStats(InputLoadStats &stats) : stats(stats) {
+    stats.beginTask();
+  }
+  ~InputLoadTaskStats() { stats.endTask(); }
+
+private:
+  InputLoadStats &stats;
+};
+
+// TimeTraceProfiler instances are thread-local. Give each pool thread its own
+// instance so --time-trace renders input-loading work on worker lanes. The
+// pool is destroyed before the main thread writes the trace, so these TLS
+// owners publish their instances in timeTraceProfilerFinishThread() first.
+class InputLoadWorkerProfiler {
+public:
+  InputLoadWorkerProfiler() {
+    timeTraceProfilerInitialize(config->timeTraceGranularity,
+                                "input load worker");
+  }
+  ~InputLoadWorkerProfiler() { timeTraceProfilerFinishThread(); }
+};
+
+static void initializeInputLoadWorkerProfiler() {
+  if (!config->timeTraceEnabled)
+    return;
+  static thread_local InputLoadWorkerProfiler profiler;
+  (void)profiler;
+}
+
+// These demos intentionally stop before ObjFile construction. Mach-O object
+// parsing currently updates the global arena and symbol table, so only the
+// thread-safe open/map, page-in, file classification, archive directory
+// parsing, and bitcode preparation are performed by workers. Publication still
+// happens below in command-line order.
+static void pageInBuffer(MemoryBufferRef mb) {
+  StringRef buffer = mb.getBuffer();
+  const size_t pageSize = Process::getPageSizeEstimate();
+  for (const char *page = buffer.begin(), *end = buffer.end(); page < end;
+       page += pageSize)
+    LLVM_ATTRIBUTE_UNUSED volatile char value = *page;
+}
+
+static void prepareInput(MemoryBufferRef mb, PreparedInput &prepared,
+                         ThreadPoolTaskGroup *nestedGroup = nullptr) {
+  file_magic magic = identify_magic(mb.getBuffer());
+
+  // ld-prime-style archive jobs split their members into child work below.
+  // Other files, and all ELF-style jobs, page in the complete top-level input.
+  if (magic != file_magic::archive || nestedGroup == nullptr)
+    pageInBuffer(mb);
+
+  if (magic == file_magic::bitcode) {
+    Expected<std::unique_ptr<lto::InputFile>> input =
+        lto::InputFile::create(mb);
+    if (input)
+      prepared.bitcode = std::move(*input);
+    else
+      consumeError(input.takeError());
+    return;
+  }
+
+  if (magic != file_magic::archive)
+    return;
+
+  Expected<std::unique_ptr<object::Archive>> archive =
+      object::Archive::create(mb);
+  if (!archive) {
+    consumeError(archive.takeError());
+    return;
+  }
+  prepared.archive = std::move(*archive);
+
+  if (!nestedGroup)
+    return;
+
+  // Match ld-prime's nested-work shape without creating one scheduler task per
+  // member. Batching also keeps large compiler archives from flooding the
+  // queue with thousands of tiny jobs.
+  constexpr size_t batchSize = 128;
+  SmallVector<MemoryBufferRef, batchSize> batch;
+  std::string archiveName = mb.getBufferIdentifier().str();
+  size_t batchIndex = 0;
+  auto submitBatch = [&](SmallVector<MemoryBufferRef, batchSize> work) {
+    std::string detail =
+        (Twine(archiveName) + " batch=" + Twine(batchIndex++) +
+         " members=" + Twine(work.size()))
+            .str();
+    nestedGroup->async([work = std::move(work), detail = std::move(detail)] {
+      initializeInputLoadWorkerProfiler();
+      TimeTraceScope trace("Prime archive batch", detail);
+      for (MemoryBufferRef member : work)
+        pageInBuffer(member);
+    });
+  };
+
+  Error err = Error::success();
+  for (const object::Archive::Child &child :
+       prepared.archive->children(err)) {
+    Expected<MemoryBufferRef> member = child.getMemoryBufferRef();
+    if (!member) {
+      consumeError(member.takeError());
+      continue;
+    }
+    batch.push_back(*member);
+    if (batch.size() == batchSize) {
+      submitBatch(std::move(batch));
+      batch.clear();
+    }
+  }
+  consumeError(std::move(err));
+  if (!batch.empty())
+    submitBatch(std::move(batch));
+}
+
+struct OpenedInput {
+  std::unique_ptr<MemoryBuffer> buffer;
+  std::error_code error;
+};
+
+static unsigned inputLoadWorkerCount() {
+  if (config->inputLoadWorkers)
+    return config->inputLoadWorkers;
+  return std::max(1u, parallel::strategy.compute_thread_count());
+}
+
+static PreparedInputs prepareInputLoadDemo(DeferredFiles &deferred) {
+  PreparedInputs prepared(deferred.size());
+  InputLoadStats stats;
+  DefaultThreadPool pool(
+      hardware_concurrency(inputLoadWorkerCount()));
+  ThreadPoolTaskGroup group(pool);
+
+  if (config->inputLoadDemo == InputLoadDemo::elfLld) {
+    // ELF lld maps inputs during the ordered argument walk, then executes a
+    // parallel LoadJob for each mapped file.
+    for (size_t i = 0; i != deferred.size(); ++i)
+      group.async([&, i] {
+        InputLoadTaskStats taskStats(stats);
+        initializeInputLoadWorkerProfiler();
+        TimeTraceScope trace("ELF input-load worker", deferred[i].path);
+        if (deferred[i].buffer) {
+          stats.mapped(deferred[i].buffer->getBufferSize());
+          prepareInput(*deferred[i].buffer, prepared[i]);
+        }
+      });
+    group.wait();
+    stats.print();
+    return prepared;
+  }
+
+  // The ios and prime demos open/map top-level files directly in fixed result
+  // slots. The prime variant additionally lets an archive job enqueue batched
+  // member work into the same pool.
+  std::vector<OpenedInput> opened(deferred.size());
+  for (size_t i = 0; i != deferred.size(); ++i) {
+    group.async([&, i] {
+      InputLoadTaskStats taskStats(stats);
+      initializeInputLoadWorkerProfiler();
+      TimeTraceScope trace(
+          config->inputLoadDemo == InputLoadDemo::ldPrime
+              ? "Prime input-load worker"
+              : "iOS input-load worker",
+          deferred[i].path);
+      ErrorOr<std::unique_ptr<MemoryBuffer>> mbOrErr =
+          MemoryBuffer::getFile(deferred[i].path, /*IsText=*/false,
+                                /*RequiresNullTerminator=*/false);
+      if (std::error_code ec = mbOrErr.getError()) {
+        opened[i].error = ec;
+        return;
+      }
+      opened[i].buffer = std::move(*mbOrErr);
+      MemoryBufferRef mb = opened[i].buffer->getMemBufferRef();
+      stats.mapped(mb.getBufferSize());
+      if (config->inputLoadDemo == InputLoadDemo::ldPrime)
+        prepareInput(mb, prepared[i], &group);
+      else
+        pageInBuffer(mb);
+    });
+  }
+  group.wait();
+  stats.print();
+
+  // Ownership transfer, cache updates, fat-slice selection, diagnostics, and
+  // reproducer writes use linker-global state and remain strictly ordered.
+  for (size_t i = 0; i != deferred.size(); ++i) {
+    if (opened[i].error) {
+      error("cannot open " + deferred[i].path + ": " +
+            opened[i].error.message());
+      continue;
+    }
+
+    MemoryBufferRef openedRef = opened[i].buffer->getMemBufferRef();
+    std::optional<MemoryBufferRef> adopted =
+        readFile(deferred[i].path, std::move(opened[i].buffer));
+    if (!adopted)
+      continue;
+    deferred[i].buffer = *adopted;
+
+    // A duplicate path may resolve to a buffer already in cachedReads. Any
+    // prepared object still refers to the now-discarded duplicate mapping.
+    if (adopted->getBufferStart() != openedRef.getBufferStart()) {
+      prepared[i].archive.reset();
+      prepared[i].bitcode.reset();
+    }
+  }
+  return prepared;
+}
+#endif
+
 static void deferFile(StringRef path, bool isLazy, DeferredFiles &deferred,
                       LoadType loadType = LoadType::CommandLine,
                       bool isNeeded = false, bool isWeak = false,
                       bool isReexport = false, bool isHidden = false,
                       bool isExplicit = true) {
+  bool inputLoadDemo = config->inputLoadDemo != InputLoadDemo::none;
+  if (loadType != LoadType::LCLinkerOption &&
+      (config->inputLoadDemo == InputLoadDemo::iosLd64 ||
+       config->inputLoadDemo == InputLoadDemo::ldPrime)) {
+    deferred.push_back({path, isLazy, std::nullopt, loadType, isNeeded, isWeak,
+                        isReexport, isHidden, isExplicit});
+    return;
+  }
+
   std::optional<MemoryBufferRef> buffer = readFile(path);
   if (!buffer)
     return;
-  if (config->readWorkers)
+  if (config->readWorkers || inputLoadDemo)
     deferred.push_back({path, isLazy, *buffer, loadType, isNeeded, isWeak,
                         isReexport, isHidden, isExplicit});
   else {
@@ -1490,17 +1789,26 @@ static void createFiles(const InputArgList &args) {
   }
 
 #if LLVM_ENABLE_THREADS
-  if (config->readWorkers) {
-    multiThreadedPageIn(deferredFiles);
+  if (config->readWorkers ||
+      config->inputLoadDemo != InputLoadDemo::none) {
+    PreparedInputs prepared(deferredFiles.size());
+    if (config->inputLoadDemo != InputLoadDemo::none)
+      prepared = prepareInputLoadDemo(deferredFiles);
+    else
+      multiThreadedPageIn(deferredFiles);
 
     DeferredFiles archiveContents;
-    for (auto &file : deferredFiles) {
+    for (auto [index, file] : llvm::enumerate(deferredFiles)) {
+      if (!file.buffer)
+        continue;
       if (loadedObjectFrameworks.contains(file.path))
         continue;
 
       auto inputFile = processFile(file.buffer, &archiveContents, file.path,
                                    file.loadType, file.isLazy, file.isExplicit,
-                                   /*isBundleLoader=*/false, file.isHidden);
+                                   /*isBundleLoader=*/false, file.isHidden,
+                                   std::move(prepared[index].archive),
+                                   std::move(prepared[index].bitcode));
       applyDylibMetadata(inputFile, file.isNeeded, file.isWeak,
                          file.isReexport);
       checkAndCacheFramework(inputFile, file.path);
@@ -1911,6 +2219,37 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     }
   }
 
+  if (auto *arg = args.getLastArg(OPT_input_load_demo)) {
+#if LLVM_ENABLE_THREADS
+    StringRef value = arg->getValue();
+    if (value == "ios")
+      config->inputLoadDemo = InputLoadDemo::iosLd64;
+    else if (value == "elf")
+      config->inputLoadDemo = InputLoadDemo::elfLld;
+    else if (value == "prime")
+      config->inputLoadDemo = InputLoadDemo::ldPrime;
+    else
+      error(arg->getSpelling() +
+            ": expected 'ios', 'elf', or 'prime', but got '" + value + "'");
+#else
+    error(arg->getSpelling() +
+          ": option unavailable because lld was not built with thread support");
+#endif
+  }
+  if (auto *arg = args.getLastArg(OPT_input_load_workers)) {
+#if LLVM_ENABLE_THREADS
+    StringRef value = arg->getValue();
+    unsigned workers = 0;
+    if (!llvm::to_integer(value, workers, 0))
+      error(arg->getSpelling() +
+            ": expected a non-negative integer, but got '" + value + "'");
+    config->inputLoadWorkers = workers;
+#else
+    error(arg->getSpelling() +
+          ": option unavailable because lld was not built with thread support");
+#endif
+  }
+  config->inputLoadStats = args.hasArg(OPT_input_load_stats);
   if (auto *arg = args.getLastArg(OPT_read_workers)) {
 #if LLVM_ENABLE_THREADS
     StringRef v(arg->getValue());
@@ -1925,6 +2264,15 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
          ": option unavailable because lld was not built with thread support");
 #endif
   }
+  if (config->readWorkers &&
+      config->inputLoadDemo != InputLoadDemo::none)
+    error("--read-workers cannot be combined with --input-load-demo");
+  if (config->inputLoadWorkers &&
+      config->inputLoadDemo == InputLoadDemo::none)
+    error("--input-load-workers requires --input-load-demo");
+  if (config->inputLoadStats &&
+      config->inputLoadDemo == InputLoadDemo::none)
+    error("--input-load-stats requires --input-load-demo");
   if (auto *arg = args.getLastArg(OPT_threads_eq)) {
     StringRef v(arg->getValue());
     unsigned threads = 0;

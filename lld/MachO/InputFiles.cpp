@@ -81,6 +81,21 @@ using namespace llvm::sys;
 using namespace lld;
 using namespace lld::macho;
 
+namespace {
+
+static StringRef getBitcodeInputName(MemoryBufferRef mb, StringRef archiveName,
+                                     uint64_t offsetInArchive) {
+  std::string path = mb.getBufferIdentifier().str();
+  if (config->thinLTOIndexOnly)
+    path = replaceThinLTOSuffix(mb.getBufferIdentifier());
+  return saver().save(archiveName.empty()
+                          ? path
+                          : archiveName + "(" + sys::path::filename(path) +
+                                ")" + utostr(offsetInArchive));
+}
+
+} // namespace
+
 // Returns "<internal>", "foo.a(bar.o)", or "baz.o".
 std::string lld::toString(const InputFile *f) {
   if (!f)
@@ -218,13 +233,23 @@ std::optional<MemoryBufferRef> macho::readFile(StringRef path) {
     return entry->second;
 
   ErrorOr<std::unique_ptr<MemoryBuffer>> mbOrErr =
-      MemoryBuffer::getFile(path, false, /*RequiresNullTerminator=*/false);
+      MemoryBuffer::getFile(path, /*IsText=*/false,
+                            /*RequiresNullTerminator=*/false);
   if (std::error_code ec = mbOrErr.getError()) {
     error("cannot open " + path + ": " + ec.message());
     return std::nullopt;
   }
 
-  std::unique_ptr<MemoryBuffer> &mb = *mbOrErr;
+  return readFile(path, std::move(*mbOrErr));
+}
+
+std::optional<MemoryBufferRef>
+macho::readFile(StringRef path, std::unique_ptr<MemoryBuffer> mb) {
+  CachedHashStringRef key(path);
+  auto entry = cachedReads.find(key);
+  if (entry != cachedReads.end())
+    return entry->second;
+
   MemoryBufferRef mbref = mb->getMemBufferRef();
   make<std::unique_ptr<MemoryBuffer>>(std::move(mb)); // take mb ownership
 
@@ -2393,13 +2418,10 @@ static macho::Symbol *createBitcodeSymbol(const lto::InputFile::Symbol &objSym,
 
 BitcodeFile::BitcodeFile(MemoryBufferRef mb, StringRef archiveName,
                          uint64_t offsetInArchive, bool lazy, bool forceHidden,
-                         bool compatArch)
+                         bool compatArch, std::unique_ptr<lto::InputFile> obj)
     : InputFile(BitcodeKind, mb, lazy), forceHidden(forceHidden) {
   this->archiveName = std::string(archiveName);
   this->compatArch = compatArch;
-  std::string path = mb.getBufferIdentifier().str();
-  if (config->thinLTOIndexOnly)
-    path = replaceThinLTOSuffix(mb.getBufferIdentifier());
 
   // If the parent archive already determines that the arch is not compat with
   // target, then just return.
@@ -2412,13 +2434,13 @@ BitcodeFile::BitcodeFile(MemoryBufferRef mb, StringRef archiveName,
   // So, we append the archive name to disambiguate two members with the same
   // name from multiple different archives, and offset within the archive to
   // disambiguate two members of the same name from a single archive.
-  MemoryBufferRef mbref(mb.getBuffer(),
-                        saver().save(archiveName.empty()
-                                         ? path
-                                         : archiveName + "(" +
-                                               sys::path::filename(path) + ")" +
-                                               utostr(offsetInArchive)));
-  obj = check(lto::InputFile::create(mbref));
+  if (obj) {
+    this->obj = std::move(obj);
+  } else {
+    MemoryBufferRef mbref(
+        mb.getBuffer(), getBitcodeInputName(mb, archiveName, offsetInArchive));
+    this->obj = check(lto::InputFile::create(mbref));
+  }
   if (lazy)
     parseLazy();
   else
