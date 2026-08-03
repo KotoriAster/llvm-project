@@ -10,7 +10,7 @@
 
 The script extracts an existing executable's final link command from Ninja,
 redirects the compiler driver to the supplied ld64.lld, and interleaves serial,
-ios, elf, and prime links to reduce time-order bias.
+ios, elf, prime, and mold links to reduce time-order bias.
 
 Example:
   lld/utils/benchmark_macho_input_loading.py \
@@ -35,7 +35,7 @@ import time
 from pathlib import Path
 
 
-MODES = ("serial", "ios", "elf", "prime")
+MODES = ("serial", "ios", "elf", "prime", "mold")
 
 
 def extract_link_command(build_dir: Path, target: str) -> list[str]:
@@ -180,7 +180,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-output-check",
         action="store_true",
-        help="Do not verify that all four modes produce byte-identical output",
+        help="Do not verify that all five modes produce byte-identical output",
     )
     return parser.parse_args()
 

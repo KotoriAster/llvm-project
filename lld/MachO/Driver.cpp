@@ -32,6 +32,7 @@
 #include "lld/Common/Version.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/BinaryFormat/MachO.h"
@@ -423,16 +424,15 @@ static void multiThreadedPageIn(const DeferredFiles &deferred) {
 }
 #endif
 
-static InputFile *processFile(std::optional<MemoryBufferRef> buffer,
-                              DeferredFiles *archiveContents, StringRef path,
-                              LoadType loadType, bool isLazy = false,
-                              bool isExplicit = true,
-                              bool isBundleLoader = false,
-                              bool isForceHidden = false,
-                              std::unique_ptr<object::Archive> preparedArchive =
-                                  nullptr,
-                              std::unique_ptr<lto::InputFile> preparedBitcode =
-                                  nullptr) {
+static InputFile *
+processFile(std::optional<MemoryBufferRef> buffer,
+            DeferredFiles *archiveContents, StringRef path, LoadType loadType,
+            bool isLazy = false, bool isExplicit = true,
+            bool isBundleLoader = false, bool isForceHidden = false,
+            std::unique_ptr<object::Archive> preparedArchive = nullptr,
+            PreparedArchiveMembers preparedArchiveMembers = {},
+            std::unique_ptr<lto::InputFile> preparedBitcode = nullptr,
+            ObjFile *preparedObject = nullptr) {
   if (!buffer)
     return nullptr;
   MemoryBufferRef mbref = *buffer;
@@ -459,7 +459,8 @@ static InputFile *processFile(std::optional<MemoryBufferRef> buffer,
               : CHECK(object::Archive::create(mbref),
                       path + ": failed to parse archive");
 
-      file = make<ArchiveFile>(std::move(archive), isForceHidden);
+      file = make<ArchiveFile>(std::move(archive), isForceHidden,
+                               std::move(preparedArchiveMembers));
 
       if (tar && file->getArchive().isThin())
         saveThinArchiveToRepro(file);
@@ -548,7 +549,14 @@ static InputFile *processFile(std::optional<MemoryBufferRef> buffer,
     break;
   }
   case file_magic::macho_object:
-    newFile = make<ObjFile>(mbref, getModTime(path), "", isLazy);
+    if (preparedObject) {
+      assert(!isLazy && "lazy objects are not prepared in parallel");
+      assert(preparedObject->mb.getBufferStart() == mbref.getBufferStart());
+      preparedObject->parsePrepared();
+      newFile = preparedObject;
+    } else {
+      newFile = make<ObjFile>(mbref, getModTime(path), "", isLazy);
+    }
     break;
   case file_magic::macho_dynamically_linked_shared_lib:
   case file_magic::macho_dynamically_linked_shared_lib_stub:
@@ -627,7 +635,9 @@ static void checkAndCacheFramework(InputFile *file, StringRef path) {
 #if LLVM_ENABLE_THREADS
 struct PreparedInput {
   std::unique_ptr<object::Archive> archive;
+  PreparedArchiveMembers archiveMembers;
   std::unique_ptr<lto::InputFile> bitcode;
+  ObjFile *object = nullptr;
 };
 using PreparedInputs = std::vector<PreparedInput>;
 
@@ -664,11 +674,23 @@ public:
   void print() const {
     if (!config->inputLoadStats)
       return;
-    StringRef mode =
-        config->inputLoadDemo == InputLoadDemo::iosLd64
-            ? "ios"
-            : config->inputLoadDemo == InputLoadDemo::elfLld ? "elf"
-                                                             : "prime";
+    StringRef mode;
+    switch (config->inputLoadDemo) {
+    case InputLoadDemo::iosLd64:
+      mode = "ios";
+      break;
+    case InputLoadDemo::elfLld:
+      mode = "elf";
+      break;
+    case InputLoadDemo::ldPrime:
+      mode = "prime";
+      break;
+    case InputLoadDemo::mold:
+      mode = "mold";
+      break;
+    case InputLoadDemo::none:
+      llvm_unreachable("serial input loading has no demo statistics");
+    }
     message("input-load-stats: mode=" + mode +
             " workers=" + Twine(inputLoadWorkerCount()) +
             " tasks=" + Twine(scheduled.load()) +
@@ -718,11 +740,10 @@ static void initializeInputLoadWorkerProfiler() {
   (void)profiler;
 }
 
-// These demos intentionally stop before ObjFile construction. Mach-O object
-// parsing currently updates the global arena and symbol table, so only the
-// thread-safe open/map, page-in, file classification, archive directory
-// parsing, and bitcode preparation are performed by workers. Publication still
-// happens below in command-line order.
+// This first preparation wave handles open/map, page-in, classification,
+// archive directories, and bitcode. A separate wave below constructs
+// file-local native sections. Symbol parsing and all global publication remain
+// on the linker thread in command-line order.
 static void pageInBuffer(MemoryBufferRef mb) {
   StringRef buffer = mb.getBuffer();
   const size_t pageSize = Process::getPageSizeEstimate();
@@ -732,7 +753,8 @@ static void pageInBuffer(MemoryBufferRef mb) {
 }
 
 static void prepareInput(MemoryBufferRef mb, PreparedInput &prepared,
-                         ThreadPoolTaskGroup *nestedGroup = nullptr) {
+                         ThreadPoolTaskGroup *nestedGroup = nullptr,
+                         InputLoadStats *stats = nullptr) {
   file_magic magic = identify_magic(mb.getBuffer());
 
   // ld-prime-style archive jobs split their members into child work below.
@@ -772,16 +794,22 @@ static void prepareInput(MemoryBufferRef mb, PreparedInput &prepared,
   std::string archiveName = mb.getBufferIdentifier().str();
   size_t batchIndex = 0;
   auto submitBatch = [&](SmallVector<MemoryBufferRef, batchSize> work) {
-    std::string detail =
-        (Twine(archiveName) + " batch=" + Twine(batchIndex++) +
-         " members=" + Twine(work.size()))
-            .str();
-    nestedGroup->async([work = std::move(work), detail = std::move(detail)] {
-      initializeInputLoadWorkerProfiler();
-      TimeTraceScope trace("Prime archive batch", detail);
-      for (MemoryBufferRef member : work)
-        pageInBuffer(member);
-    });
+    std::string detail = (Twine(archiveName) + " batch=" + Twine(batchIndex++) +
+                          " members=" + Twine(work.size()))
+                             .str();
+    nestedGroup->async(
+        [work = std::move(work), detail = std::move(detail), stats] {
+          if (stats)
+            stats->beginTask();
+          scope_exit finishStats([&] {
+            if (stats)
+              stats->endTask();
+          });
+          initializeInputLoadWorkerProfiler();
+          TimeTraceScope trace("Prime archive batch", detail);
+          for (MemoryBufferRef member : work)
+            pageInBuffer(member);
+        });
   };
 
   Error err = Error::success();
@@ -821,7 +849,35 @@ static PreparedInputs prepareInputLoadDemo(DeferredFiles &deferred) {
       hardware_concurrency(inputLoadWorkerCount()));
   ThreadPoolTaskGroup group(pool);
 
-  if (config->inputLoadDemo == InputLoadDemo::elfLld) {
+  if (config->inputLoadDemo == InputLoadDemo::mold) {
+    // mold maps files and enumerates archives serially, then gives each object
+    // its own parse task. Keep archive construction on the linker thread so
+    // the member jobs below have stable, ordered slots.
+    for (size_t i = 0; i != deferred.size(); ++i) {
+      if (!deferred[i].buffer)
+        continue;
+      MemoryBufferRef mb = *deferred[i].buffer;
+      stats.mapped(mb.getBufferSize());
+      if (identify_magic(mb.getBuffer()) == file_magic::archive) {
+        Expected<std::unique_ptr<object::Archive>> archive =
+            object::Archive::create(mb);
+        if (archive)
+          prepared[i].archive = std::move(*archive);
+        else
+          consumeError(archive.takeError());
+        continue;
+      }
+      if (identify_magic(mb.getBuffer()) == file_magic::macho_object)
+        continue;
+      group.async([&, i] {
+        InputLoadTaskStats taskStats(stats);
+        initializeInputLoadWorkerProfiler();
+        TimeTraceScope trace("Mold input-load worker", deferred[i].path);
+        prepareInput(*deferred[i].buffer, prepared[i]);
+      });
+    }
+    group.wait();
+  } else if (config->inputLoadDemo == InputLoadDemo::elfLld) {
     // ELF lld maps inputs during the ordered argument walk, then executes a
     // parallel LoadJob for each mapped file.
     for (size_t i = 0; i != deferred.size(); ++i)
@@ -835,66 +891,179 @@ static PreparedInputs prepareInputLoadDemo(DeferredFiles &deferred) {
         }
       });
     group.wait();
-    stats.print();
-    return prepared;
-  }
+  } else {
+    // The ios and prime demos open/map top-level files directly in fixed
+    // result slots. The prime variant additionally lets an archive job enqueue
+    // batched member work into the same pool.
+    std::vector<OpenedInput> opened(deferred.size());
+    for (size_t i = 0; i != deferred.size(); ++i) {
+      group.async([&, i] {
+        InputLoadTaskStats taskStats(stats);
+        initializeInputLoadWorkerProfiler();
+        TimeTraceScope trace(config->inputLoadDemo == InputLoadDemo::ldPrime
+                                 ? "Prime input-load worker"
+                                 : "iOS input-load worker",
+                             deferred[i].path);
+        ErrorOr<std::unique_ptr<MemoryBuffer>> mbOrErr =
+            MemoryBuffer::getFile(deferred[i].path, /*IsText=*/false,
+                                  /*RequiresNullTerminator=*/false);
+        if (std::error_code ec = mbOrErr.getError()) {
+          opened[i].error = ec;
+          return;
+        }
+        opened[i].buffer = std::move(*mbOrErr);
+        MemoryBufferRef mb = opened[i].buffer->getMemBufferRef();
+        stats.mapped(mb.getBufferSize());
+        if (config->inputLoadDemo == InputLoadDemo::ldPrime)
+          prepareInput(mb, prepared[i], &group, &stats);
+        else
+          pageInBuffer(mb);
+      });
+    }
+    group.wait();
 
-  // The ios and prime demos open/map top-level files directly in fixed result
-  // slots. The prime variant additionally lets an archive job enqueue batched
-  // member work into the same pool.
-  std::vector<OpenedInput> opened(deferred.size());
-  for (size_t i = 0; i != deferred.size(); ++i) {
-    group.async([&, i] {
-      InputLoadTaskStats taskStats(stats);
-      initializeInputLoadWorkerProfiler();
-      TimeTraceScope trace(
-          config->inputLoadDemo == InputLoadDemo::ldPrime
-              ? "Prime input-load worker"
-              : "iOS input-load worker",
-          deferred[i].path);
-      ErrorOr<std::unique_ptr<MemoryBuffer>> mbOrErr =
-          MemoryBuffer::getFile(deferred[i].path, /*IsText=*/false,
-                                /*RequiresNullTerminator=*/false);
-      if (std::error_code ec = mbOrErr.getError()) {
-        opened[i].error = ec;
-        return;
+    // Ownership transfer, cache updates, fat-slice selection, diagnostics, and
+    // reproducer writes use linker-global state and remain strictly ordered.
+    for (size_t i = 0; i != deferred.size(); ++i) {
+      if (opened[i].error) {
+        error("cannot open " + deferred[i].path + ": " +
+              opened[i].error.message());
+        continue;
       }
-      opened[i].buffer = std::move(*mbOrErr);
-      MemoryBufferRef mb = opened[i].buffer->getMemBufferRef();
-      stats.mapped(mb.getBufferSize());
-      if (config->inputLoadDemo == InputLoadDemo::ldPrime)
-        prepareInput(mb, prepared[i], &group);
-      else
-        pageInBuffer(mb);
-    });
+
+      MemoryBufferRef openedRef = opened[i].buffer->getMemBufferRef();
+      std::optional<MemoryBufferRef> adopted =
+          readFile(deferred[i].path, std::move(opened[i].buffer));
+      if (!adopted)
+        continue;
+      deferred[i].buffer = *adopted;
+
+      // A duplicate path may resolve to a buffer already in cachedReads. Any
+      // prepared metadata still refers to the now-discarded duplicate mapping.
+      if (adopted->getBufferStart() != openedRef.getBufferStart()) {
+        prepared[i].archive.reset();
+        prepared[i].bitcode.reset();
+      }
+    }
   }
-  group.wait();
+
+  // These modes keep file-local object construction off the linker thread.
+  // ObjFile IDs are deliberately left unassigned here: ordered publication
+  // assigns them later so archive extraction retains exactly the serial order.
+  if (config->inputLoadDemo != InputLoadDemo::iosLd64) {
+    for (size_t i = 0; i != deferred.size(); ++i) {
+      if (!deferred[i].buffer || deferred[i].isLazy ||
+          identify_magic(deferred[i].buffer->getBuffer()) !=
+              file_magic::macho_object)
+        continue;
+      prepared[i].object = make<ObjFile>(
+          *deferred[i].buffer, getModTime(deferred[i].path), "",
+          /*lazy=*/false, deferred[i].isHidden, /*compatArch=*/true,
+          /*builtFromBitcode=*/false, /*deferParsing=*/true);
+    }
+
+    if (config->inputLoadDemo == InputLoadDemo::mold) {
+      // mold speculatively parses every native archive member, even members
+      // that lazy symbol resolution never selects. Only file-local sections
+      // are built here; archive selection and symbol publication stay ordered.
+      for (size_t i = 0; i != deferred.size(); ++i) {
+        if (!prepared[i].archive)
+          continue;
+        Error err = Error::success();
+        for (const object::Archive::Child &child :
+             prepared[i].archive->children(err)) {
+          Expected<MemoryBufferRef> member = child.getMemoryBufferRef();
+          if (!member) {
+            consumeError(member.takeError());
+            continue;
+          }
+          if (identify_magic(member->getBuffer()) != file_magic::macho_object)
+            continue;
+          Expected<TimePoint<std::chrono::seconds>> modTime =
+              child.getLastModified();
+          if (!modTime) {
+            consumeError(modTime.takeError());
+            continue;
+          }
+          uint32_t timestamp = config->zeroModTime ? 0 : toTimeT(*modTime);
+          ObjFile *object = make<ObjFile>(
+              *member, timestamp,
+              prepared[i].archive->getMemoryBufferRef().getBufferIdentifier(),
+              /*lazy=*/false, deferred[i].isHidden, /*compatArch=*/true,
+              /*builtFromBitcode=*/false, /*deferParsing=*/true);
+          prepared[i].archiveMembers.push_back(
+              {child.getChildOffset(), *member, object});
+        }
+        consumeError(std::move(err));
+        llvm::sort(prepared[i].archiveMembers,
+                   [](const PreparedArchiveMember &lhs,
+                      const PreparedArchiveMember &rhs) {
+                     return lhs.offset < rhs.offset;
+                   });
+      }
+    }
+
+    for (size_t i = 0; i != deferred.size(); ++i) {
+      if (!prepared[i].object)
+        continue;
+      group.async([&, i] {
+        InputLoadTaskStats taskStats(stats);
+        initializeInputLoadWorkerProfiler();
+        TimeTraceScope trace("Mach-O object section parse", deferred[i].path);
+        prepared[i].object->parseSectionsInParallel();
+      });
+    }
+
+    if (config->inputLoadDemo == InputLoadDemo::mold) {
+      for (size_t i = 0; i != prepared.size(); ++i) {
+        for (size_t memberIndex = 0;
+             memberIndex != prepared[i].archiveMembers.size(); ++memberIndex) {
+          group.async([&, i, memberIndex] {
+            InputLoadTaskStats taskStats(stats);
+            initializeInputLoadWorkerProfiler();
+            PreparedArchiveMember &member =
+                prepared[i].archiveMembers[memberIndex];
+            TimeTraceScope trace("Mold archive member parse",
+                                 member.buffer.getBufferIdentifier());
+            member.object->parseSectionsInParallel();
+          });
+        }
+      }
+    }
+    group.wait();
+  }
+
   stats.print();
-
-  // Ownership transfer, cache updates, fat-slice selection, diagnostics, and
-  // reproducer writes use linker-global state and remain strictly ordered.
-  for (size_t i = 0; i != deferred.size(); ++i) {
-    if (opened[i].error) {
-      error("cannot open " + deferred[i].path + ": " +
-            opened[i].error.message());
-      continue;
-    }
-
-    MemoryBufferRef openedRef = opened[i].buffer->getMemBufferRef();
-    std::optional<MemoryBufferRef> adopted =
-        readFile(deferred[i].path, std::move(opened[i].buffer));
-    if (!adopted)
-      continue;
-    deferred[i].buffer = *adopted;
-
-    // A duplicate path may resolve to a buffer already in cachedReads. Any
-    // prepared object still refers to the now-discarded duplicate mapping.
-    if (adopted->getBufferStart() != openedRef.getBufferStart()) {
-      prepared[i].archive.reset();
-      prepared[i].bitcode.reset();
-    }
-  }
   return prepared;
+}
+
+static void processDeferredFiles(DeferredFiles &deferred) {
+  PreparedInputs prepared(deferred.size());
+  if (config->inputLoadDemo != InputLoadDemo::none)
+    prepared = prepareInputLoadDemo(deferred);
+  else
+    multiThreadedPageIn(deferred);
+
+  DeferredFiles archiveContents;
+  for (auto [index, file] : llvm::enumerate(deferred)) {
+    if (!file.buffer || loadedObjectFrameworks.contains(file.path))
+      continue;
+
+    InputFile *inputFile =
+        processFile(file.buffer, &archiveContents, file.path, file.loadType,
+                    file.isLazy, file.isExplicit, /*isBundleLoader=*/false,
+                    file.isHidden, std::move(prepared[index].archive),
+                    std::move(prepared[index].archiveMembers),
+                    std::move(prepared[index].bitcode), prepared[index].object);
+    applyDylibMetadata(inputFile, file.isNeeded, file.isWeak, file.isReexport);
+    checkAndCacheFramework(inputFile, file.path);
+
+    if (ArchiveFile *archive = dyn_cast<ArchiveFile>(inputFile))
+      archive->addLazySymbols();
+  }
+
+  if (!archiveContents.empty())
+    multiThreadedPageIn(archiveContents);
 }
 #endif
 
@@ -904,9 +1073,8 @@ static void deferFile(StringRef path, bool isLazy, DeferredFiles &deferred,
                       bool isReexport = false, bool isHidden = false,
                       bool isExplicit = true) {
   bool inputLoadDemo = config->inputLoadDemo != InputLoadDemo::none;
-  if (loadType != LoadType::LCLinkerOption &&
-      (config->inputLoadDemo == InputLoadDemo::iosLd64 ||
-       config->inputLoadDemo == InputLoadDemo::ldPrime)) {
+  if (config->inputLoadDemo == InputLoadDemo::iosLd64 ||
+      config->inputLoadDemo == InputLoadDemo::ldPrime) {
     deferred.push_back({path, isLazy, std::nullopt, loadType, isNeeded, isWeak,
                         isReexport, isHidden, isExplicit});
     return;
@@ -1042,6 +1210,13 @@ void macho::resolveLCLinkerOptions() {
                  /*isReexport=*/false, /*isHidden=*/false,
                  /*isExplicit=*/false, LoadType::LCLinkerOption, deferred);
     }
+
+#if LLVM_ENABLE_THREADS
+    if (config->readWorkers || config->inputLoadDemo != InputLoadDemo::none) {
+      processDeferredFiles(deferred);
+      continue;
+    }
+#endif
 
     for (auto &file : deferred) {
       if (loadedObjectFrameworks.contains(file.path))
@@ -1789,37 +1964,8 @@ static void createFiles(const InputArgList &args) {
   }
 
 #if LLVM_ENABLE_THREADS
-  if (config->readWorkers ||
-      config->inputLoadDemo != InputLoadDemo::none) {
-    PreparedInputs prepared(deferredFiles.size());
-    if (config->inputLoadDemo != InputLoadDemo::none)
-      prepared = prepareInputLoadDemo(deferredFiles);
-    else
-      multiThreadedPageIn(deferredFiles);
-
-    DeferredFiles archiveContents;
-    for (auto [index, file] : llvm::enumerate(deferredFiles)) {
-      if (!file.buffer)
-        continue;
-      if (loadedObjectFrameworks.contains(file.path))
-        continue;
-
-      auto inputFile = processFile(file.buffer, &archiveContents, file.path,
-                                   file.loadType, file.isLazy, file.isExplicit,
-                                   /*isBundleLoader=*/false, file.isHidden,
-                                   std::move(prepared[index].archive),
-                                   std::move(prepared[index].bitcode));
-      applyDylibMetadata(inputFile, file.isNeeded, file.isWeak,
-                         file.isReexport);
-      checkAndCacheFramework(inputFile, file.path);
-
-      if (ArchiveFile *archive = dyn_cast<ArchiveFile>(inputFile))
-        archive->addLazySymbols();
-    }
-
-    if (!archiveContents.empty())
-      multiThreadedPageIn(archiveContents);
-
+  if (config->readWorkers || config->inputLoadDemo != InputLoadDemo::none) {
+    processDeferredFiles(deferredFiles);
     pageInQueue.stopAllWork = true;
   }
 #endif
@@ -2228,9 +2374,12 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
       config->inputLoadDemo = InputLoadDemo::elfLld;
     else if (value == "prime")
       config->inputLoadDemo = InputLoadDemo::ldPrime;
+    else if (value == "mold")
+      config->inputLoadDemo = InputLoadDemo::mold;
     else
       error(arg->getSpelling() +
-            ": expected 'ios', 'elf', or 'prime', but got '" + value + "'");
+            ": expected 'ios', 'elf', 'prime', or 'mold', but got '" + value +
+            "'");
 #else
     error(arg->getSpelling() +
           ": option unavailable because lld was not built with thread support");

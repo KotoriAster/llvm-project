@@ -60,4 +60,6 @@ settings. For Bazel, this can be done with ``--linkopt`` or with
    :hidden:
 
    InputLoading
+   InputLoadingComparison
+   InputLoadingComparisonAppendix
    ld64-vs-lld

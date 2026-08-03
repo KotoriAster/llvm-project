@@ -407,7 +407,7 @@ def interposable : Flag<["-"], "interposable">,
     HelpText<"Indirects access to all exported symbols in an image">,
     Group<grp_opts>;
 def input_load_demo : Joined<["--"], "input-load-demo=">,
-    HelpText<"Select an experimental ordered input-loading scheduler: ios, elf, or prime. Default is serial.">,
+    HelpText<"Select an experimental ordered input-loading and object-preparation scheduler: ios, elf, prime, or mold. Default is serial.">,
     Group<grp_lld>;
 def input_load_stats : Flag<["--"], "input-load-stats">,
     HelpText<"Print task concurrency and mapped-byte statistics for --input-load-demo.">,

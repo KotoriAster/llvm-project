@@ -83,6 +83,7 @@ enum class InputLoadDemo {
   iosLd64,
   elfLld,
   ldPrime,
+  mold,
 };
 
 struct SectionAlign {

@@ -42,6 +42,7 @@ namespace macho {
 
 struct PlatformInfo;
 class ConcatInputSection;
+class InputSection;
 class Symbol;
 class Defined;
 class AliasSymbol;
@@ -127,21 +128,29 @@ public:
   // We use this string for creating error messages.
   std::string archiveName;
 
-  // Provides an easy way to sort InputFiles deterministically.
-  const int id;
+  // Provides an easy way to sort InputFiles deterministically. Parallel object
+  // preparation defers assigning this until ordered publication, so archive
+  // members extracted by an earlier input retain their original position.
+  int id;
 
   // True if this is a lazy ObjFile or BitcodeFile.
   bool lazy = false;
 
 protected:
-  InputFile(Kind kind, MemoryBufferRef mb, bool lazy = false)
-      : mb(mb), id(idCount++), lazy(lazy), fileKind(kind),
+  InputFile(Kind kind, MemoryBufferRef mb, bool lazy = false,
+            bool deferId = false)
+      : mb(mb), id(deferId ? -1 : idCount++), lazy(lazy), fileKind(kind),
         name(mb.getBufferIdentifier()) {}
 
   InputFile(Kind, const llvm::MachO::InterfaceFile &);
 
   // If true, this input's arch is compatible with target.
   bool compatArch = true;
+
+  void assignId() {
+    assert(id == -1 && "input file ID assigned more than once");
+    id = idCount++;
+  }
 
 private:
   const Kind fileKind;
@@ -161,12 +170,20 @@ class ObjFile final : public InputFile {
 public:
   ObjFile(MemoryBufferRef mb, uint32_t modTime, StringRef archiveName,
           bool lazy = false, bool forceHidden = false, bool compatArch = true,
-          bool builtFromBitcode = false);
+          bool builtFromBitcode = false, bool deferParsing = false);
+  ~ObjFile() override;
   ArrayRef<llvm::MachO::data_in_code_entry> getDataInCode() const;
   ArrayRef<uint8_t> getOptimizationHints() const;
   template <class LP> void parse();
   template <class LP>
   void parseLinkerOptions(llvm::SmallVectorImpl<StringRef> &LinkerOptions);
+
+  // The parallel input loader only runs the file-local section phase on a
+  // worker. parsePrepared() performs all global symbol-table publication on
+  // the linker thread, in input order.
+  void parseSectionsInParallel();
+  void parsePrepared();
+  void parsePreparedLazy();
 
   static bool classof(const InputFile *f) { return f->kind() == ObjKind; }
 
@@ -187,9 +204,18 @@ public:
   std::vector<AliasSymbol *> aliases;
 
 private:
+  struct ParseAllocators;
+  struct ParseDiagnostic {
+    std::string message;
+    bool isFatal;
+  };
+
   llvm::once_flag initDwarf;
   template <class LP> void parseLazy();
-  template <class SectionHeader> void parseSections(ArrayRef<SectionHeader>);
+  template <class SectionHeader>
+  void parseSections(ArrayRef<SectionHeader>, bool parallel = false);
+  template <class LP> bool canParseSectionsInParallel() const;
+  template <class LP> void parseSectionsInParallel();
   template <class LP>
   void parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
                     ArrayRef<typename LP::nlist> nList, const char *strtab,
@@ -203,7 +229,23 @@ private:
   void splitEhFrames(ArrayRef<uint8_t> dataArr, Section &ehFrameSection);
   void registerCompactUnwind(Section &compactUnwindSection);
   void registerEhFrames(Section &ehFrameSection);
+
+  template <class T, class... Args> T *makeInputSection(Args &&...args);
+  template <class... Args> Section *makeSection(Args &&...args);
+
+  bool parsingDeferred = false;
+  std::unique_ptr<ParseAllocators> parseAllocators;
+  std::vector<std::pair<Section *, llvm::ArrayRef<uint8_t>>>
+      deferredEhFrameSections;
+  std::vector<ParseDiagnostic> parseDiagnostics;
 };
+
+struct PreparedArchiveMember {
+  uint64_t offset = 0;
+  llvm::MemoryBufferRef buffer;
+  ObjFile *object = nullptr;
+};
+using PreparedArchiveMembers = std::vector<PreparedArchiveMember>;
 
 // command-line -sectcreate file
 class OpaqueFile final : public InputFile {
@@ -287,7 +329,8 @@ private:
 class ArchiveFile final : public InputFile {
 public:
   explicit ArchiveFile(std::unique_ptr<llvm::object::Archive> &&file,
-                       bool forceHidden);
+                       bool forceHidden,
+                       PreparedArchiveMembers preparedMembers = {});
   void addLazySymbols();
   void fetch(const llvm::object::Archive::Symbol &);
   // LLD normally doesn't use Error for error-handling, but the underlying
@@ -300,6 +343,7 @@ private:
   Expected<InputFile *> childToObjectFile(const llvm::object::Archive::Child &c,
                                           bool lazy);
   std::unique_ptr<llvm::object::Archive> file;
+  PreparedArchiveMembers preparedMembers;
   // Keep track of children fetched from the archive by tracking
   // which address offsets have been fetched already.
   llvm::DenseSet<uint64_t> seen;

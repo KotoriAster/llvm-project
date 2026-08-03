@@ -359,10 +359,42 @@ static Error parseCallGraph(ArrayRef<uint8_t> data,
   return Error::success();
 }
 
+struct ObjFile::ParseAllocators {
+  // Declare Section first so it is destroyed after the InputSections which
+  // reference it.
+  SpecificBumpPtrAllocator<Section> sections;
+  SpecificBumpPtrAllocator<ConcatInputSection> concatInputSections;
+  SpecificBumpPtrAllocator<CStringInputSection> cStringInputSections;
+  SpecificBumpPtrAllocator<WordLiteralInputSection> wordInputSections;
+};
+
+template <class... Args> Section *ObjFile::makeSection(Args &&...args) {
+  if (!parsingDeferred)
+    return make<Section>(std::forward<Args>(args)...);
+  return new (parseAllocators->sections.Allocate())
+      Section(std::forward<Args>(args)...);
+}
+
+template <class T, class... Args> T *ObjFile::makeInputSection(Args &&...args) {
+  if (!parsingDeferred)
+    return make<T>(std::forward<Args>(args)...);
+  T *storage;
+  if constexpr (std::is_same_v<T, ConcatInputSection>)
+    storage = parseAllocators->concatInputSections.Allocate();
+  else if constexpr (std::is_same_v<T, CStringInputSection>)
+    storage = parseAllocators->cStringInputSections.Allocate();
+  else {
+    static_assert(std::is_same_v<T, WordLiteralInputSection>);
+    storage = parseAllocators->wordInputSections.Allocate();
+  }
+  return new (storage) T(std::forward<Args>(args)...);
+}
+
 // Parse the sequence of sections within a single LC_SEGMENT(_64).
 // Split each section into subsections.
 template <class SectionHeader>
-void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders) {
+void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders,
+                            bool parallel) {
   sections.reserve(sectionHeaders.size());
   auto *buf = reinterpret_cast<const uint8_t *>(mb.getBufferStart());
 
@@ -371,10 +403,14 @@ void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders) {
         StringRef(sec.sectname, strnlen(sec.sectname, sizeof(sec.sectname)));
     StringRef segname =
         StringRef(sec.segname, strnlen(sec.segname, sizeof(sec.segname)));
-    sections.push_back(make<Section>(this, segname, name, sec.flags, sec.addr));
+    sections.push_back(makeSection(this, segname, name, sec.flags, sec.addr));
     if (sec.align >= 32) {
-      error("alignment " + std::to_string(sec.align) + " of section " + name +
-            " is too large");
+      std::string message = "alignment " + std::to_string(sec.align) +
+                            " of section " + name.str() + " is too large";
+      if (parallel)
+        parseDiagnostics.push_back({std::move(message), /*isFatal=*/false});
+      else
+        error(message);
       continue;
     }
     Section &section = *sections.back();
@@ -389,7 +425,7 @@ void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders) {
       Subsections &subsections = section.subsections;
       subsections.reserve(data.size() / recordSize);
       for (uint64_t off = 0; off < data.size(); off += recordSize) {
-        auto *isec = make<ConcatInputSection>(
+        auto *isec = makeInputSection<ConcatInputSection>(
             section, data.slice(off, std::min(data.size(), recordSize)), align);
         subsections.push_back({off, isec});
       }
@@ -397,30 +433,104 @@ void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders) {
     };
 
     if (sectionType(sec.flags) == S_CSTRING_LITERALS) {
-      if (sec.nreloc)
-        fatal(toString(this) + ": " + sec.segname + "," + sec.sectname +
-              " contains relocations, which is unsupported");
+      if (sec.nreloc) {
+        std::string message = toString(this) + ": " + sec.segname + "," +
+                              sec.sectname +
+                              " contains relocations, which is unsupported";
+        if (parallel) {
+          parseDiagnostics.push_back({std::move(message), /*isFatal=*/true});
+          return;
+        }
+        fatal(message);
+      }
       bool dedupLiterals =
           name == section_names::objcMethname || config->dedupStrings;
-      InputSection *isec =
-          make<CStringInputSection>(section, data, align, dedupLiterals);
+      InputSection *isec = makeInputSection<CStringInputSection>(
+          section, data, align, dedupLiterals);
+      if (parallel) {
+        size_t off = 0;
+        StringRef remaining = toStringRef(data);
+        while (!remaining.empty()) {
+          size_t end = remaining.find(0);
+          if (end == StringRef::npos) {
+            parseDiagnostics.push_back(
+                {isec->getLocation(off) + ": string is not null terminated",
+                 /*isFatal=*/true});
+            return;
+          }
+          size_t size = end + 1;
+          remaining = remaining.substr(size);
+          off += size;
+        }
+      }
       // FIXME: parallelize this?
       cast<CStringInputSection>(isec)->splitIntoPieces();
       section.subsections.push_back({0, isec});
     } else if (isWordLiteralSection(sec.flags)) {
-      if (sec.nreloc)
-        fatal(toString(this) + ": " + sec.segname + "," + sec.sectname +
-              " contains relocations, which is unsupported");
-      InputSection *isec = make<WordLiteralInputSection>(section, data, align);
+      if (sec.nreloc) {
+        std::string message = toString(this) + ": " + sec.segname + "," +
+                              sec.sectname +
+                              " contains relocations, which is unsupported";
+        if (parallel) {
+          parseDiagnostics.push_back({std::move(message), /*isFatal=*/true});
+          return;
+        }
+        fatal(message);
+      }
+      InputSection *isec =
+          makeInputSection<WordLiteralInputSection>(section, data, align);
       section.subsections.push_back({0, isec});
     } else if (auto recordSize = getRecordSize(segname, name)) {
       splitRecords(*recordSize);
     } else if (name == section_names::ehFrame &&
                segname == segment_names::text) {
-      splitEhFrames(data, *sections.back());
+      if (parallel) {
+        size_t off = 0;
+        while (off < data.size()) {
+          const size_t frameOff = off;
+          auto fail = [&](const Twine &message) {
+            parseDiagnostics.push_back(
+                {(toString(this) + ":(__eh_frame+0x" +
+                  Twine::utohexstr(frameOff) + "): " + message)
+                     .str(),
+                 /*isFatal=*/true});
+          };
+          if (off + 4 > data.size()) {
+            fail("CIE/FDE too small");
+            return;
+          }
+          uint64_t length = read32le(data.data() + off);
+          off += 4;
+          if (length == dwarf::DW_LENGTH_DWARF64) {
+            if (off + 8 > data.size()) {
+              fail("CIE/FDE too small");
+              return;
+            }
+            length = read64le(data.data() + off);
+            off += 8;
+          }
+          if (off + length > data.size()) {
+            fail("CIE/FDE extends past the end of the section");
+            return;
+          }
+          if (length == 0)
+            break;
+          off += length;
+        }
+        deferredEhFrameSections.emplace_back(sections.back(), data);
+      } else {
+        splitEhFrames(data, *sections.back());
+      }
     } else if (segname == segment_names::llvm) {
-      if (config->callGraphProfileSort && name == section_names::cgProfile)
-        checkError(parseCallGraph(data, callGraph));
+      if (config->callGraphProfileSort && name == section_names::cgProfile) {
+        if (Error e = parseCallGraph(data, callGraph)) {
+          if (parallel)
+            parseDiagnostics.push_back(
+                {toString(std::move(e)), /*isFatal=*/false});
+          else
+            checkError(std::move(e));
+        }
+      }
       // ld64 does not appear to emit contents from sections within the __LLVM
       // segment. Symbols within those sections point to bitcode metadata
       // instead of actual symbols. Global symbols within those sections could
@@ -434,7 +544,7 @@ void ObjFile::parseSections(ArrayRef<SectionHeader> sectionHeaders) {
       if (name == section_names::addrSig)
         addrSigSection = sections.back();
 
-      auto *isec = make<ConcatInputSection>(section, data, align);
+      auto *isec = makeInputSection<ConcatInputSection>(section, data, align);
       if (isDebugSection(isec->getFlags()) &&
           isec->getSegName() == segment_names::dwarf) {
         // Instead of emitting DWARF sections, we emit STABS symbols to the
@@ -467,9 +577,9 @@ void ObjFile::splitEhFrames(ArrayRef<uint8_t> data, Section &ehFrameSection) {
     // Note that we still want to preserve the alignment of the overall section,
     // just not of the individual EH frames.
     ehFrameSection.subsections.push_back(
-        {frameOff, make<ConcatInputSection>(ehFrameSection,
-                                            data.slice(frameOff, fullLength),
-                                            /*align=*/1)});
+        {frameOff, makeInputSection<ConcatInputSection>(
+                       ehFrameSection, data.slice(frameOff, fullLength),
+                       /*align=*/1)});
   }
   ehFrameSection.doneSplitting = true;
 }
@@ -960,7 +1070,7 @@ void ObjFile::parseSymbols(ArrayRef<typename LP::section> sectionHeaders,
       }
       auto *concatIsec = cast<ConcatInputSection>(isec);
 
-      auto *nextIsec = make<ConcatInputSection>(*concatIsec);
+      auto *nextIsec = makeInputSection<ConcatInputSection>(*concatIsec);
       nextIsec->wasCoalesced = false;
       if (isZeroFill(isec->getFlags())) {
         // Zero-fill sections have NULL data.data() non-zero data.size()
@@ -1022,11 +1132,16 @@ void ObjFile::parseLinkerOptions(SmallVectorImpl<StringRef> &LCLinkerOptions) {
 SmallVector<StringRef> macho::unprocessedLCLinkerOptions;
 ObjFile::ObjFile(MemoryBufferRef mb, uint32_t modTime, StringRef archiveName,
                  bool lazy, bool forceHidden, bool compatArch,
-                 bool builtFromBitcode)
-    : InputFile(ObjKind, mb, lazy), modTime(modTime), forceHidden(forceHidden),
-      builtFromBitcode(builtFromBitcode) {
+                 bool builtFromBitcode, bool deferParsing)
+    : InputFile(ObjKind, mb, lazy, /*deferId=*/deferParsing), modTime(modTime),
+      forceHidden(forceHidden), builtFromBitcode(builtFromBitcode),
+      parsingDeferred(deferParsing) {
   this->archiveName = std::string(archiveName);
   this->compatArch = compatArch;
+  if (deferParsing) {
+    parseAllocators = std::make_unique<ParseAllocators>();
+    return;
+  }
   if (lazy) {
     if (target->wordSize == 8)
       parseLazy<LP64>();
@@ -1038,6 +1153,64 @@ ObjFile::ObjFile(MemoryBufferRef mb, uint32_t modTime, StringRef archiveName,
     else
       parse<ILP32>();
   }
+}
+
+ObjFile::~ObjFile() = default;
+
+template <class LP> bool ObjFile::canParseSectionsInParallel() const {
+  using Header = typename LP::mach_header;
+  if (!compatArch)
+    return false;
+  const auto *hdr = reinterpret_cast<const Header *>(mb.getBufferStart());
+  uint32_t cpuType;
+  std::tie(cpuType, std::ignore) = getCPUTypeFromArchitecture(config->arch());
+  return hdr->cputype == cpuType;
+}
+
+template <class LP> void ObjFile::parseSectionsInParallel() {
+  using Header = typename LP::mach_header;
+  using SegmentCommand = typename LP::segment_command;
+  using SectionHeader = typename LP::section;
+
+  if (!canParseSectionsInParallel<LP>())
+    return;
+
+  auto *hdr = reinterpret_cast<const Header *>(mb.getBufferStart());
+  if (const load_command *cmd = findCommand(hdr, LP::segmentLCType)) {
+    auto *c = reinterpret_cast<const SegmentCommand *>(cmd);
+    ArrayRef<SectionHeader> sectionHeaders{
+        reinterpret_cast<const SectionHeader *>(c + 1), c->nsects};
+    parseSections(sectionHeaders, /*parallel=*/true);
+  }
+}
+
+void ObjFile::parseSectionsInParallel() {
+  assert(parsingDeferred && "parallel section parse was not requested");
+  if (target->wordSize == 8)
+    parseSectionsInParallel<LP64>();
+  else
+    parseSectionsInParallel<ILP32>();
+}
+
+void ObjFile::parsePrepared() {
+  assert(parsingDeferred && "object file was already parsed");
+  assert(!lazy && "lazy objects need lazy symbol publication");
+  assignId();
+  if (target->wordSize == 8)
+    parse<LP64>();
+  else
+    parse<ILP32>();
+  parsingDeferred = false;
+}
+
+void ObjFile::parsePreparedLazy() {
+  assert(parsingDeferred && "object file was already parsed");
+  assert(lazy && "non-lazy objects need full symbol publication");
+  assignId();
+  if (target->wordSize == 8)
+    parseLazy<LP64>();
+  else
+    parseLazy<ILP32>();
 }
 
 template <class LP> void ObjFile::parse() {
@@ -1061,12 +1234,26 @@ template <class LP> void ObjFile::parse() {
   parseLinkerOptions<LP>(LCLinkerOptions);
   unprocessedLCLinkerOptions.append(LCLinkerOptions);
 
+  if (parsingDeferred) {
+    for (ParseDiagnostic &diagnostic : parseDiagnostics) {
+      if (diagnostic.isFatal)
+        fatal(diagnostic.message);
+      error(diagnostic.message);
+    }
+    parseDiagnostics.clear();
+
+    for (auto [section, data] : deferredEhFrameSections)
+      splitEhFrames(data, *section);
+    deferredEhFrameSections.clear();
+  }
+
   ArrayRef<SectionHeader> sectionHeaders;
   if (const load_command *cmd = findCommand(hdr, LP::segmentLCType)) {
     auto *c = reinterpret_cast<const SegmentCommand *>(cmd);
     sectionHeaders = ArrayRef<SectionHeader>{
         reinterpret_cast<const SectionHeader *>(c + 1), c->nsects};
-    parseSections(sectionHeaders);
+    if (!parsingDeferred)
+      parseSections(sectionHeaders);
   }
 
   // TODO: Error on missing LC_SYMTAB?
@@ -1101,6 +1288,7 @@ template <class LP> void ObjFile::parse() {
     registerCompactUnwind(*compactUnwindSection);
   if (ehFrameSection)
     registerEhFrames(*ehFrameSection);
+  parsingDeferred = false;
 }
 
 template <class LP> void ObjFile::parseLazy() {
@@ -2257,9 +2445,10 @@ void DylibFile::checkAppExtensionSafety(bool dylibIsAppExtensionSafe) const {
     warn("using '-application_extension' with unsafe dylib: " + toString(this));
 }
 
-ArchiveFile::ArchiveFile(std::unique_ptr<object::Archive> &&f, bool forceHidden)
+ArchiveFile::ArchiveFile(std::unique_ptr<object::Archive> &&f, bool forceHidden,
+                         PreparedArchiveMembers preparedMembers)
     : InputFile(ArchiveKind, f->getMemoryBufferRef()), file(std::move(f)),
-      forceHidden(forceHidden) {}
+      preparedMembers(std::move(preparedMembers)), forceHidden(forceHidden) {}
 
 void ArchiveFile::addLazySymbols() {
   // Avoid calling getMemoryBufferRef() on zero-symbol archive
@@ -2378,8 +2567,26 @@ ArchiveFile::childToObjectFile(const llvm::object::Archive::Child &c,
   if (!modTime)
     return modTime.takeError();
 
-  return loadArchiveMember(*mb, toTimeT(*modTime), getName(),
-                           c.getChildOffset(), forceHidden, compatArch, lazy);
+  uint64_t offset = c.getChildOffset();
+  auto prepared =
+      llvm::lower_bound(preparedMembers, offset,
+                        [](const PreparedArchiveMember &member,
+                           uint64_t value) { return member.offset < value; });
+  if (prepared != preparedMembers.end() && prepared->offset == offset &&
+      prepared->object) {
+    ObjFile *object = prepared->object;
+    prepared->object = nullptr;
+    assert(object->mb.getBufferStart() == mb->getBufferStart());
+    object->lazy = lazy;
+    if (lazy)
+      object->parsePreparedLazy();
+    else
+      object->parsePrepared();
+    return object;
+  }
+
+  return loadArchiveMember(*mb, toTimeT(*modTime), getName(), offset,
+                           forceHidden, compatArch, lazy);
 }
 
 static macho::Symbol *createBitcodeSymbol(const lto::InputFile::Symbol &objSym,

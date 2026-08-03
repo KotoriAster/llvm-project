@@ -13,11 +13,11 @@ of the path from a file name to an ``InputFile``:
   open/map file -> make pages resident -> classify/prepare -> publish InputFile
                                                             and symbols
 
-The central constraint is deterministic publication.  Mach-O object parsing
-allocates from linker-global arenas and updates the global symbol table.
-Consequently, the modes described here parallelize only work that can be
-performed independently.  They publish inputs in command-line order on the
-linker thread.
+The central constraint is deterministic publication.  Mach-O symbol parsing
+updates the global symbol table, lazy archive state, and other order-sensitive
+linker state.  Consequently, the modes described here parallelize only work
+that can be owned by one input.  They publish inputs and symbols in command-line
+order on the linker thread.
 
 This is input-loading parallelism, not parallel linking in general.  Later
 stages controlled by ``--threads=`` are outside the scope of these modes.
@@ -52,13 +52,18 @@ Summary
    * - ``elf``
      - Linker thread
      - Worker pool, complete top-level input
-     - Archive directory and bitcode preparation
-     - Linker thread, ordered
+     - Archive directory, bitcode, and native section preparation
+     - Linker thread, ordered symbols and remaining parse
    * - ``prime``
      - Worker pool
      - Worker pool, archive members in batches
-     - Archive directory and bitcode preparation
-     - Linker thread, ordered
+     - Archive directory, bitcode, and native section preparation
+     - Linker thread, ordered symbols and remaining parse
+   * - ``mold``
+     - Linker thread
+     - Per-native-object worker task
+     - Every direct native object and native archive member
+     - Linker thread, ordered archive selection, symbols, and remaining parse
 
 ``serial``: demand-driven baseline
 ----------------------------------
@@ -150,6 +155,13 @@ Each worker:
 * constructs the LLVM archive directory representation for an archive; or
 * constructs the LTO input representation for bitcode.
 
+After that first barrier, native objects enter a second worker wave which
+creates their file-local ``Section`` and ``InputSection`` graphs, splits
+literal and record sections, and prepares call-graph data.  Those nodes are
+owned by the corresponding ``ObjFile`` rather than the linker-global arena.
+The worker records diagnostics in its fixed result slot; the linker thread
+replays them in input order.
+
 Prepared objects are stored by input index and later consumed by
 ``processFile`` in command-line order.
 
@@ -159,15 +171,17 @@ This is attractive when archive-directory or bitcode preparation is
 significant.  It cannot hide the cost of the initial ordered opens, and a task
 per top-level input can be inefficient when there are many tiny files.
 
-The name describes the scheduler being modeled; it does not mean that the
-Mach-O linker runs the ELF linker's complete input-file parser.
+The name describes the scheduler being modeled.  As in ELF lld, file-local
+construction is parallel while global symbol publication remains serial.  It
+does not mean that the Mach-O linker runs the ELF linker's complete parser.
 
 ``prime``: hierarchical archive work
 -------------------------------------
 
 The ld-prime-style demo begins like ``ios``: workers open/map top-level inputs
 into ordered result slots.  A worker also classifies the input and prepares
-archive or bitcode metadata.
+archive or bitcode metadata.  Direct native objects then use the same
+file-local section-parse wave as ``elf`` before ordered combination.
 
 For an archive, the top-level task enumerates members and submits page-in work
 back to the same pool.  Members are grouped into batches of 128 rather than
@@ -193,24 +207,69 @@ archive resolution never extracts.  It is most plausible for large,
 archive-heavy, cold or partially cold workloads, and least plausible when
 only a small fraction of archive members is needed.
 
+``mold``: speculative object parsing
+-------------------------------------
+
+The mold-style demo keeps top-level open/map and archive enumeration on the
+linker thread.  It then creates one parse task for every direct native object
+and every native object member of an archive.  Unlike the other modes, archive
+members are prepared whether or not lazy archive resolution will eventually
+extract them:
+
+.. code-block:: text
+
+  linker thread: map libA.a -> enumerate [A.o, B.o, C.o] -> ordered combine
+  workers:                         parse A.o | parse B.o | parse C.o
+
+Each worker constructs only its object's file-local section graph and records
+diagnostics in the object.  An indexed archive keeps the prepared object
+detached until a lazy symbol selects that member.  For an archive without an
+index, ordered publication first registers the prepared object as lazy and a
+later extraction reuses the already-built sections.  Diagnostics from an
+unselected speculative member are never emitted.
+
+This captures mold's speculative, one-task-per-object parsing policy and its
+ability to expose parallelism inside large archives.  It also exposes the
+policy's central tradeoff: links that use only a small fraction of an archive
+pay to parse all of its native members and retain their section graphs until
+archive selection finishes.
+
+The Mach-O implementation deliberately stops short of mold's concurrent symbol
+interning and priority-based resolver.  Symbols, archive selection, and all
+other global state remain ordered to preserve Mach-O LLD behavior.  Bitcode
+archive members also continue through the existing on-demand LTO path.  Thus
+the mode is a safe mold-shaped parsing experiment, not a port of mold's entire
+resolver.
+
 What deliberately remains serial
 ---------------------------------
 
-All experimental modes stop before constructing ``ObjFile`` instances.
-The following operations remain ordered on the linker thread:
+The ``elf``, ``prime``, and ``mold`` modes construct unpublished ``ObjFile``
+shells and their file-local section graphs before the ordered combine.  They
+deliberately do not publish global linker state from a worker.  The following
+operations remain ordered on the linker thread:
 
 * adopting buffers into the linker's read cache;
 * duplicate-path handling and fat-slice selection;
 * reproducer and diagnostic updates;
-* construction and publication of ``InputFile`` objects;
-* Mach-O section, relocation, and symbol parsing;
+* assignment of deterministic ``InputFile`` IDs and publication of inputs;
+* Mach-O symbol and relocation parsing;
 * updates to the global symbol table; and
-* archive extraction decisions and their observable ordering.
+* debug/unwind registration, archive extraction decisions, and their
+  observable ordering.
 
-This boundary is the reason the modes can preserve output semantics without
-locking the global symbol table.  It also caps their potential speedup.  If
-ordered parsing and publication dominate the link, input-loading parallelism
-cannot substantially change total wall time.
+Deferring the file ID is important: publishing an object may extract a member
+from an earlier archive, and that member must receive its ID before the next
+top-level object just as it does in serial mode.  This boundary preserves that
+behavior without locking the global symbol table.  It also caps potential
+speedup.  If symbol, relocation, or unwind processing dominates the link, the
+remaining serial work will dominate wall time.
+
+``LC_LINKER_OPTION`` inputs discovered after the initial combine enter an
+explicit new loading wave and use the selected scheduler again.  They never
+mutate a worker wave that is already active.  Native objects generated by LTO
+still use the serial object parser and remain a future re-entry point for this
+protocol.
 
 Selecting and observing a mode
 ------------------------------
@@ -222,6 +281,7 @@ The experimental modes are selected with:
   $ ld64.lld --input-load-demo=ios --input-load-workers=18 ...
   $ ld64.lld --input-load-demo=elf --input-load-workers=18 ...
   $ ld64.lld --input-load-demo=prime --input-load-workers=18 ...
+  $ ld64.lld --input-load-demo=mold --input-load-workers=18 ...
 
 If ``--input-load-workers`` is zero or omitted, the mode uses the linker's
 configured thread count.  ``--input-load-stats`` prints scheduled and completed
@@ -240,6 +300,9 @@ The trace contains worker lanes named ``input load worker`` and events named
 ``iOS input-load worker``, ``ELF input-load worker``,
 ``Prime input-load worker``, or ``Prime archive batch``.  Overlapping events on
 different lanes demonstrate that the intended work actually ran concurrently.
+The ``elf``, ``prime``, and ``mold`` modes additionally contain ``Mach-O object
+section parse`` events for direct native inputs.  Mold archive-member tasks are
+named ``Mold archive member parse``.
 
 Benchmarking guidance
 ---------------------
@@ -255,8 +318,8 @@ modes in one randomized, interleaved run using:
 * enough repetitions to expose variance and outliers; and
 * output hashes to verify semantic equivalence.
 
-``lld/utils/benchmark_macho_input_loading.py`` automates the four-way
-``serial``/``ios``/``elf``/``prime`` comparison and verifies that their outputs
-are byte-identical.  Results from ``--read-workers`` must not be used as a
-proxy for an experimental mode: the modes move different work and intentionally
-make different I/O and scheduling tradeoffs.
+``lld/utils/benchmark_macho_input_loading.py`` automates the five-way
+``serial``/``ios``/``elf``/``prime``/``mold`` comparison and verifies that
+their outputs are byte-identical.  Results from ``--read-workers`` must not be
+used as a proxy for an experimental mode: the modes move different work and
+intentionally make different I/O and scheduling tradeoffs.
