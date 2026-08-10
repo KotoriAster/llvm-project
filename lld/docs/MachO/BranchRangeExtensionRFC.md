@@ -29,11 +29,8 @@ The core idea replaces the fixed slop guess with reservations driven by actual
 demand: the planner reserves exactly the space the extenders it placed need
 (`reservedExtra`) and lays the program out against it, so a branch is in range
 iff the proposal's own exact addresses put it there. A proposal is never
-patched. On any out-of-range edge, the failing pass grows `reservedExtra` and
-forces proven-unreachable branches, then the whole proposal is discarded and
-rebuilt with more room — unlike ELF lld, which mutates its output in place. The
-planner grows shared island chains from each destination and
-iterates this monotonic fixed point until every edge is in range.
+patched: the failing proposal update the reservedSpace and contribute to next
+pass.
 
 The modes differ only in how far an island chain may grow before falling back to
 a thunk (the per-group planning that grows those chains is covered in §4.3):
@@ -83,28 +80,24 @@ reservation and places the real extenders alone.
 ```cpp
 collectFinalizerContext();
 
-bool converged = false;
 for (pass = 0; pass < 30; ++pass) {
-  planningLayout = layoutReservationEnvelope();          // loose, padded
-  proposal       = planExtensionProposal(planningLayout);
-  proposalLayout = layoutExtensionProposal(proposal);    // exact
-  if (validateExtensionProposal(proposal, proposalLayout)) {
-    converged = true;
-    break;                                               // self-valid
-  }
+    ExtensionLayout reservedLayout(ctx); // loose, padded
+    proposal = planExtensionProposal(reservedLayout);
+    ExtensionLayout proposalLayout(ctx, proposal); // exact
+    if (validateExtensionProposal(proposal, proposalLayout).empty()) {
+      materializeExtenders(proposal); // create synthetic sections/symbols
+      rewriteBranches(proposal, proposalLayout);
+      emitInBoundaryOrder(proposal); // assert exact-layout addresses match
+      return;
+    }
 
-  bool changed = growReservationEnvelope(proposal.desiredExtra);
-  if (!changed)
-    changed = forceInvalidDirectBranches(proposal.invalidDirectCallsites);
-  if (!changed)
-    break;
+    bool updated = ctx.updateReservation(proposal.desiredExtra);
+    if (!updated)
+      updated = forceInvalidDirectBranches(proposal, proposalLayout);
+    if (!updated)
+      fail();
 }
-if (!converged)
-  fail();
-
-materializeExtenders(proposal);       // create synthetic sections/symbols
-rewriteBranches(proposal, proposalLayout);
-emitInBoundaryOrder(proposal);        // assert exact-layout addresses match
+fail();
 ```
 
 ## 2. Benchmark results
