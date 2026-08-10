@@ -73,6 +73,13 @@ enum class ICFLevel {
   all,
 };
 
+enum class BranchRangeExtensionMode {
+  thunks,  // 12-byte adrp+add+br x16 (corrupts x16)
+  islandsSlopFree, // target-anchored, exact-layout island-only planner
+  hybrid,      // at most two islands from the callee in either direction, then
+               // a 12-byte thunk for longer jumps
+};
+
 enum class ObjCStubsMode {
   fast,
   small,
@@ -200,6 +207,9 @@ struct Configuration {
   UndefinedSymbolTreatment undefinedSymbolTreatment =
       UndefinedSymbolTreatment::error;
   ICFLevel icfLevel = ICFLevel::none;
+  BranchRangeExtensionMode branchRangeExtensionMode =
+      BranchRangeExtensionMode::thunks;
+  uint64_t branchIslandRegionSize = 4 * 1024 * 1024;
   bool keepICFStabs = false;
   ObjCStubsMode objcStubsMode = ObjCStubsMode::fast;
   llvm::MachO::HeaderFileType outputType;
