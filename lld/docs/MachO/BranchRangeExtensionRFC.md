@@ -24,41 +24,25 @@ chain to two islands and uses thunks for the remaining calls.
 
 ### 1.1 Exact-layout iteration
 
-The existing Mach-O thunk algorithm finalizes once and protects that decision
-with fixed slop. This is simple but contracts every branch range before actual
-extender demand is known. ELF lld instead iterates by changing real output
-layout until its thunks stabilize.
+The slop-free modes keep planning separate from committed output. Each pass
+builds a fresh extender graph, calculates the layout containing only its live
+extenders, and validates every `BRANCH26` edge. A rejected graph is rebuilt;
+only a self-validating graph is materialized.
 
-This design keeps iteration separate from committed output. A reservation
-layout replaces global slop with extender demand observed at each boundary,
-giving the planner a more realistic estimate without contracting every branch
-range. An exact layout then removes unused reservation and contains only the
-live extenders. A rejected graph is rebuilt; only a self-validating graph is
-materialized.
+A rejection increases the reservation at boundaries whose demand grew or marks
+newly invalid direct calls as requiring an extender. Both facts are monotonic
+across passes. Iteration fails after 30 passes if no proposal validates. See
+[validation and learning](#b1-validation-and-learning) for the corresponding
+state updates.
 
-Extenders change later layout, so finalization uses multiple passes. Each pass:
+### 1.2 Pseudocode
 
-1. Builds a fresh extender graph and callsite routes.
-2. Calculates the exact layout containing only the live planned extenders.
-3. Validates every `BRANCH26` edge against that layout.
-
-A failing layout teaches the next pass two facts: how many extender bytes each
-boundary must reserve, and which direct calls must instead use an extender.
-Both facts are monotonic across passes.
-
-Iteration stops after 30 passes if no exact layout validates.
-
-### 1.2 Driver
-
-In schematic form (reservation growth and call promotion are inline loops in
-`Finalizer::run`):
+Reservation growth and call promotion are inline loops in `Finalizer::run`:
 
 ```cpp
-collect();
-
 for (pass = 1; pass <= 30; ++pass) {
-  plan();       // reservation layout, then a fresh extender graph
-  layout(true); // exact layout containing live extenders only
+  plan(); // reservation layout, then a fresh callee-centric extender graph
+  walkLayout(LayoutKind::proposal); // exact layout with live extenders only
   if (validate())
     break;
 
@@ -71,15 +55,70 @@ if (pass > 30)
 
 materialize();
 rewriteBranchesAndCollectStats();
-layout(true, /*emit=*/true);
+walkLayout(LayoutKind::commit);
 ```
+
+### 1.3 Callee-centric planning
+
+Planning is coverage-driven rather than callsite-driven:
+
+1. **Build a pessimistic coverage graph.** For each callee side, the furthest
+   callsite defines the region extent. Against one reservation layout, emit an
+   ordered island chain and enough thunk candidates to cover that region.
+   Placement depends only on the callee, extent, policy, and reservation—not on
+   which callsite is visited first.
+2. **Route callsites.** Keep a call direct when it reaches the callee; otherwise
+   binary-search the ordered candidates for a reachable forward extender on
+   the lower side or backward extender on the upper side. This phase creates no
+   extenders.
+3. **Eliminate unused extenders.** Treat routed extenders as roots and retain
+   their transitive callee-directed chains. An island remains live when an
+   outward island uses it even if no callsite does; remove every other
+   candidate.
+
+### 1.4 Comparison
+
+**Pass strategy:**
+
+- `thunks`: single pass protected by fixed slop.
+- ELF: multiple passes that mutate output until stable.
+- `hybrid`: multiple passes that learn from and rebuild rejected proposals.
+
+**Layout exactness:**
+
+- ELF: materialized layout recalculated by `assignAddresses()`.
+- `hybrid`: uncommitted proposal calculated manually by
+  [`walkLayout()`](#b2-layout) and checked again at commit.
+
+Here, `hybrid` also represents the shared exact-layout machinery used by
+`islands-slop-free`.
+
+The placement policies are illustrated below. Arrows show the first branch hop
+and, for islands, subsequent range-limited hops toward the target.
+
+![Comparison of branch extender placement policies](branch-range-extension-placement.svg)
+
+**Placement preference:**
+
+- `thunks`: place the active thunk near the forward edge of the waiting
+  callsite's reach, maximizing distance from that callsite and reuse by later
+  callsites.
+- `islands`: place islands in the fixed reserved region rather than optimizing
+  distance to an individual callsite or callee.
+- ELF: prefer an existing pre-spaced `ThunkSection` within callsite reach; if
+  none exists, place one immediately beside the callsite.
+- `hybrid`: place each island as far from the callee toward the furthest
+  callsite as its callee-directed hop permits; place a fallback thunk at the
+  nearest legal boundary to the uncovered callsite.
 
 ## 2. Benchmark results
 
-`thunks` is the existing lld mode. `islands` is the downstream implementation
-of ld64-style islands with a fixed reserved island region. The two new modes
-replace that fixed reservation with exact-layout iteration. *Contribution* is
-the total emitted extender code: 4 bytes per island and 12 bytes per thunk.
+**Experiment setting.** We link two production binaries: AwemeLGCore with a
+360 MiB `__text` and TikTokCore with a 420 MiB `__text`. Each binary is linked
+in four modes: the existing lld `thunks`, the downstream fixed-reservation
+`islands`, and the new exact-layout `islands-slop-free` and `hybrid` modes.
+*Contribution* is the total emitted extender code: 4 bytes per island and 12
+bytes per thunk.
 
 | Mode | `x16` clobber | Slop-free | AwemeLGCore contribution | TikTokCore contribution |
 |---|:---:|:---:|---:|---:|
@@ -97,10 +136,9 @@ The extender counts behind those contributions are:
 | `islands-slop-free` | 0 | 461,523 | 0 | 869,543 |
 | `hybrid` | 0 | 461,523 | 59,371 | 783,688 |
 
-AwemeLGCore has a 360 MiB `__text`; two island hops cover its call distances,
-so `hybrid` and `islands-slop-free` produce exactly the same layout. TikTokCore
-has a 420 MiB `__text`; calls beyond two island hops account for hybrid's thunk
-tail.
+Two island hops cover all AwemeLGCore call distances, so `hybrid` and
+`islands-slop-free` produce exactly the same layout. TikTokCore calls beyond
+two island hops account for hybrid's thunk tail.
 
 ### Linking Performance
 TikTokCore:
@@ -127,46 +165,37 @@ Page-in Events:
 
 ### 3.1 Data model
 
-The implementation uses one in-place pointer graph rather than separate
-context, proposal, and layout objects:
+The implementation uses one in-place pointer graph:
 
 | Structure | Main state |
 |---|---|
 | `Boundary` | input section, cross-pass `reserved`, per-pass `planned`, derived VA |
-| `Callee` | symbol, addend, cached local-target input/value, sorted callsites |
-| `Callsite` | relocation, input index, monotonic `forceExtender`, selected extender pointer |
-| `Extender` | callee pointer, boundary index, island/thunk kind, liveness, VA, materialized section and symbol |
+| `Callee` | canonical target and sorted callsites |
+| `Callsite` | relocation, input boundary, monotonic `forceExtender`, selected extender |
+| `Extender` | callee, boundary index, kind, liveness, VA, materialized section and symbol |
 
-`Finalizer` owns the output-section run, flattened boundaries, callees, current
-extenders, later-section estimate cache, text end, and boundary-probe count.
-`ExtensionStats` is populated only after validation and does not participate in
-planning.
+The helpers consume this graph as follows:
 
-Only `Boundary::reserved` and `Callsite::forceExtender` survive a rejected pass.
-`Boundary::planned`, callsite routes, and extenders are rebuilt by `plan()`.
-
-### 3.2 Exactness contract
-
-The exact calculation must reproduce the emitted text layout byte for byte: all
-owner and input alignment, all input sizes, extender alignment, and every live
-extender size must be included, while unused reservation must be excluded. The
-final emit runs the same calculation and asserts that finalization agrees with
-it. Calculation details are left to the implementation.
-
-### 3.3 Callee-centric planning
-
-Calls are grouped by effective callee and kept in address order. For a resolved
-callee, planning splits calls around the target and plans both sides from the
-farthest call inward. Each side creates one shared island chain; the callee owns
-one thunk set reused across both sides. Nearer calls reuse those extenders
-instead of repeating placement searches.
-
-This changes the number of independent extender-planning groups from one per
-callsite to at most two per callee: O(callees) rather than O(callsites). Each
-group creates a shared island chain and contributes to the callee's shared thunk
-set for calls on both sides. Call assignment and validation remain linear in
-callsites, but removing repeated placement searches substantially reduces the
-dominant planning time on large links.
+- `plan()` reads callee groups, `reserved`, and `forceExtender`, then rebuilds
+  `planned`, callsite routes, and the live `Extender` graph.
+- [`walkLayout()`](#b2-layout) reads the shared owners, boundaries, inputs, and
+  current extenders, then updates their derived layout state.
+  - `LayoutKind::reservation` lays out inputs with `Boundary::reserved` to
+    provide planning VAs.
+  - `LayoutKind::proposal` lays out inputs with live extenders and no
+    reservation to provide exact validation VAs.
+  - `LayoutKind::commit` lays out materialized extenders, finalizes the output,
+    and checks emitted VAs against the proposal.
+- [`validate()`](#b1-validation-and-learning) reads those VAs and callsite
+  routes to accept or reject every `BRANCH26` edge.
+- [`growBoundaryReservations()`](#b1-validation-and-learning) reads rejected
+  per-boundary demand and monotonically raises `reserved`.
+- [`forceInvalidDirectCalls()`](#b1-validation-and-learning) reads rejected
+  direct routes and monotonically sets `forceExtender`.
+- `materialize()` reads the accepted extender graph and creates each
+  extender's input section and symbol.
+- `rewriteBranchesAndCollectStats()` reads accepted callsite routes, retargets
+  required relocations, and records their extender kinds.
 
 ## Appendix A: Terminology
 
@@ -198,36 +227,7 @@ island chain. It clobbers `x16`.
 
 ## Appendix B: Implementation reference
 
-### B.1 Collection
-
-Collection flattens the contiguous run of code inputs into `Boundary` order and
-groups branch relocations by effective destination. A local, non-binding
-`Defined` is keyed by `(input section, value + addend)` so aliases share one
-callee; other targets use `(symbol, addend)`. Callsites are stored in address
-order. Local target coordinates are cached in the callee.
-
-### B.2 Planning and layout
-
-`plan()` clears the old graph, resets per-boundary planned bytes and callsite
-routes, and calculates the reservation layout. The reservation at each boundary
-is the largest live extender demand observed there, keeping provisional
-placement close to the exact layout and reducing repeated placement changes.
-Unresolved non-DTrace targets use thunks in hybrid mode and fail in islands-only
-mode.
-
-For a resolved callee, each address side grows a chain from the target toward
-the farthest call needing extension. Hybrid stops after two islands;
-islands-only continues while legal boundaries exist. Each call selects its
-nearest reachable island. Hybrid falls back to a callee-scoped thunk, probing
-candidate boundaries outward from the callsite. Unused islands are removed and
-live extenders are stable-sorted by boundary before exact layout.
-
-Creating an extender immediately increases `Boundary::planned`, so later
-extenders at the same boundary get distinct provisional positions. After exact
-layout, `forEachIslandEdge` sweeps boundary-sorted extenders in both directions
-and reconstructs the next inward island per callee.
-
-### B.3 Validation and learning
+### B.1 Validation and learning
 
 Every island must reach its next inward island or callee, every routed call must
 reach its extender, and every remaining direct call must reach its callee.
@@ -236,15 +236,16 @@ remain direct.
 
 After failure, reservations first grow to live planned bytes. Only when no
 reservation grows are exact-layout direct failures marked `forceExtender`.
-Planning then clears and rebuilds the rejected graph.
 
-### B.4 Commit
+### B.2 Layout
 
 Materialization creates islands from the target outward so each relay can refer
 to an existing inward symbol, then creates thunks. Rewriting keeps a call direct
 when the accepted exact layout permits it; otherwise it retargets the relocation
 to the selected extender and clears the addend.
 
-The final emit uses `layout(true, true)`. Verbose statistics report passes,
-branch relocations, island/chain/thunk calls, island and thunk counts, verified
-`BRANCH26` edges, boundary probes, and total extenders.
+`walkLayout(LayoutKind::commit)` repeats the accepted proposal layout while
+finalizing inputs and extenders, and asserts that their emitted VAs match the
+proposal. Verbose statistics report passes, branch relocations,
+island/chain/thunk calls, island and thunk counts, verified `BRANCH26` edges,
+boundary probes, and total extenders.
