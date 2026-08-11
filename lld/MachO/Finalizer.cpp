@@ -60,7 +60,7 @@ struct Callsite {
   // Branch relocation rewritten to the selected extender after materialization.
   Relocation *reloc;
 
-  // Non-owning layout record for the input section that owns `reloc`.
+  // Boundary of the input section owning `reloc`; supplies its tentative VA.
   Boundary *layoutBoundary;
 
   // First branch hop, later used to redirect the materialized relocation.
@@ -74,10 +74,10 @@ struct Callee {
   // Index of the input hosting a local target; UINT32_MAX for nonlocal targets.
   uint32_t targetInputIdx = UINT32_MAX;
 
-  // Call sites sharing this effective branch target.
   SmallVector<Callsite, 1> callsites;
-
-  auto target() const { return cast<Symbol *>(callsites[0].reloc->referent); }
+  Symbol *target() const {
+    return cast<Symbol *>(callsites[0].reloc->referent);
+  }
   int64_t addend() const { return callsites.front().reloc->addend; }
   bool isDtrace() const {
     return target()->getName().starts_with("___dtrace_");
@@ -108,8 +108,6 @@ struct Extender {
 
   // The insertion boundary connects the proposal to its owning text section.
   uint32_t boundaryIdx;
-
-  // Thunks and islands use different encodings and routing rules.
   bool isThunk;
 
   // Only candidates referenced by a call or island chain are materialized.
@@ -193,8 +191,14 @@ private:
     return alignToPowerOf2(boundaries[idx].va + boundaries[idx].isec->getSize(),
                            4);
   }
+  // Return the first byte available after extenders already assigned to this
+  // boundary, so a proposal cannot overlap an earlier candidate.
   uint64_t proposedExtenderVA(uint32_t) const;
+  // Return the index of the first boundary at `va` or later. The upper form
+  // instead returns the first index whose boundary is strictly later than `va`.
   uint32_t boundaryBound(uint64_t, bool) const;
+  // Keep representative insertion points about one 1 MiB apart. This prevents
+  // island chains from concentrating at the edge of their branch window.
   void initializePlacementBoundaries();
   uint64_t callsiteVA(const Callsite &c) const {
     return c.layoutBoundary->va + c.reloc->offset;
@@ -206,6 +210,9 @@ private:
                 SmallVectorImpl<Extender *> &, uint64_t);
   void planCallee(Callee &);
   void plan();
+  // Extenders are boundary-ordered. Walking each side from the target outward
+  // makes the previously visited island the current island's next branch hop,
+  // so the extender need not store a redundant extender-to-extender edge.
   template <typename Visitor> bool forEachIslandEdge(Visitor);
   bool validate();
   void materialize();
@@ -228,6 +235,7 @@ void Finalizer::collect() {
   for (auto [idx, boundary] : llvm::enumerate(boundaries))
     inputIndexes[boundary.isec] = idx;
 
+  // Cache the boundary index for a locally defined branch target.
   auto cacheTargetInput = [&](Callee &callee, Symbol *sym) {
     if (needsBinding(sym))
       return;
@@ -243,6 +251,7 @@ void Finalizer::collect() {
   };
 
   DenseMap<CalleeKey, Callee *> calleeByKey;
+  // Group a branch relocation with calls to the same effective target.
   auto addCallsite = [&](Relocation &reloc, Boundary &input) {
     Symbol *sym = cast<Symbol *>(reloc.referent);
     bool binds = needsBinding(sym);
@@ -257,6 +266,7 @@ void Finalizer::collect() {
     callee->callsites.push_back({&reloc, &input});
   };
 
+  // Collect each boundary's branch relocations in increasing address order.
   for (auto &boundary : boundaries) {
     auto &relocs = boundary.isec->relocs;
     if (!llvm::is_sorted(relocs, [](const Relocation &a, const Relocation &b) {
@@ -288,26 +298,31 @@ Finalizer::estimateSectionVA(OutputSection *targetSection) {
       it != estimatedSectionVAs.end())
     return it->second;
 
-  uint64_t va = textEndVA;
   const auto &sections = first.parent->getSections();
-  auto begin = std::next(llvm::find(sections, owners.back()));
-  for (auto *osec : llvm::make_range(begin, sections.end())) {
+  auto it = llvm::find(sections, owners.back());
+  assert(it != sections.end());
+
+  uint64_t va = textEndVA;
+  for (++it; it != sections.end(); ++it) {
+    OutputSection *osec = *it;
     if (!osec->isNeeded())
       continue;
+
     va = alignToPowerOf2(va, osec->align);
     if (osec == targetSection) {
-      estimatedSectionVAs[osec] = va;
+      estimatedSectionVAs[targetSection] = va;
       return va;
     }
+
+    uint64_t size = osec->getSize();
     if (auto *concat = dyn_cast<ConcatOutputSection>(osec)) {
-      uint64_t size = llvm::accumulate(
-          concat->inputs, uint64_t(0), [](uint64_t size, auto *isec) {
-            size = alignToPowerOf2(size, isec->align);
-            return size + isec->getSize();
-          });
-      va += size;
-    } else
-      va += osec->getSize();
+      size = 0;
+      for (auto *isec : concat->inputs) {
+        size = alignToPowerOf2(size, isec->align);
+        size += isec->getSize();
+      }
+    }
+    va += size;
   }
   return std::nullopt;
 }
@@ -315,94 +330,109 @@ Finalizer::estimateSectionVA(OutputSection *targetSection) {
 std::optional<uint64_t> Finalizer::targetVA(const Callee &callee) {
   Symbol *sym = callee.target();
   int64_t addend = callee.addend();
+
   if (sym->isInStubs()) {
     if (in.stubs->isFinal)
       return sym->getStubVA() + addend;
     if (auto va = estimateSectionVA(in.stubs))
       return *va + uint64_t(sym->stubsIndex) * target->stubSize + addend;
+    return std::nullopt;
   }
+
   auto *defined = dyn_cast<Defined>(sym);
-  bool targetsObjCStubs =
-      defined && in.objcStubs && defined->isec() == in.objcStubs->isec;
-  if (targetsObjCStubs && in.objcStubs->isNeeded())
+  if (!defined)
+    return std::nullopt;
+
+  if (in.objcStubs && defined->isec() == in.objcStubs->isec &&
+      in.objcStubs->isNeeded()) {
     if (auto va = estimateSectionVA(in.objcStubs))
       return *va + defined->value + addend;
-  if (defined && defined->isAbsolute())
+    return std::nullopt;
+  }
+
+  if (defined->isAbsolute())
     return defined->getVA() + addend;
   if (callee.targetInputIdx == UINT32_MAX)
     return std::nullopt;
+
   return boundaries[callee.targetInputIdx].va + defined->value + addend;
 }
 
 void Finalizer::walkLayout(LayoutKind kind) {
-  bool useProposal = kind != LayoutKind::reservation;
-  bool commit = kind == LayoutKind::commit;
-  uint64_t addr = first.addr;
+  const bool commit = kind == LayoutKind::commit;
+  const uint64_t groupAddr = first.addr;
   uint64_t groupSize = 0;
   uint32_t inputIdx = 0;
   size_t extenderIdx = 0;
+
   for (auto *owner : owners) {
     groupSize = alignToPowerOf2(groupSize, owner->align);
-    uint64_t ownerBase = groupSize;
-    uint64_t ownerSize = 0;
+    const uint64_t ownerVA = groupAddr + groupSize;
+    uint64_t offset = 0;
+
     if (commit) {
-      owner->addr = owner->hybridAddr = addr + ownerBase;
+      owner->addr = owner->hybridAddr = ownerVA;
       owner->size = owner->fileSize = 0;
     }
+
+    // Place one input, extender, or reservation in the current owner.
+    auto placeContribution = [&](uint64_t size, uint32_t alignment) {
+      offset = alignToPowerOf2(offset, alignment);
+      uint64_t va = ownerVA + offset;
+      offset += size;
+      return va;
+    };
+
     for (auto *isec : owner->inputs) {
-      ownerSize = alignToPowerOf2(ownerSize, isec->align);
-      boundaries[inputIdx].va = addr + ownerBase + ownerSize;
-      ownerSize += isec->getSize();
+      Boundary &boundary = boundaries[inputIdx];
+      boundary.va = placeContribution(isec->getSize(), isec->align);
       if (commit) {
         owner->finalizeOne(isec);
-        assert(isec->getVA() == boundaries[inputIdx].va);
+        assert(isec->getVA() == boundary.va);
       }
-      if (useProposal)
+
+      if (kind == LayoutKind::reservation) {
+        if (boundary.reserved)
+          placeContribution(boundary.reserved, 4);
+      } else {
         while (extenderIdx < extenders.size() &&
                extenders[extenderIdx]->boundaryIdx == inputIdx) {
-          ownerSize = alignToPowerOf2(ownerSize, 4);
           Extender &extender = *extenders[extenderIdx++];
-          extender.va = addr + ownerBase + ownerSize;
-          ownerSize += extenderSize(extender);
+          extender.va = placeContribution(extenderSize(extender), 4);
           if (commit) {
             owner->finalizeOne(extender.isec);
             assert(extender.isec->getVA() == extender.va);
             owner->thunks.push_back(extender.isec);
           }
         }
-      else if (boundaries[inputIdx].reserved)
-        ownerSize =
-            alignToPowerOf2(ownerSize, 4) + boundaries[inputIdx].reserved;
-      groupSize = ownerBase + ownerSize;
+      }
       ++inputIdx;
     }
+
+    groupSize += offset;
     if (commit)
       owner->hybridFinalized = true;
   }
-  textEndVA = addr + groupSize;
+
+  assert(inputIdx == boundaries.size());
+  assert(kind == LayoutKind::reservation || extenderIdx == extenders.size());
+  textEndVA = groupAddr + groupSize;
   estimatedSectionVAs.clear();
 }
 
-// Return the first byte available after extenders already assigned to this
-// boundary, so a proposal cannot overlap an earlier candidate.
 uint64_t Finalizer::proposedExtenderVA(uint32_t boundaryIdx) const {
   return boundaryBaseVA(boundaryIdx) + boundaries[boundaryIdx].planned;
 }
 
-// Return the index of the first boundary at `va` or later. The upper form
-// instead returns the first index whose boundary is strictly later than `va`.
 uint32_t Finalizer::boundaryBound(uint64_t va, bool upper) const {
   va = addSat(va, upper);
-  return llvm::partition_point(boundaries,
-                               [&](const Boundary &boundary) {
-                                 return boundaryBaseVA(&boundary -
-                                                       boundaries.data()) < va;
-                               }) -
-         boundaries.begin();
+  // Test whether a boundary precedes the adjusted search address.
+  auto isBeforeVA = [&](const Boundary &boundary) {
+    return boundaryBaseVA(&boundary - boundaries.data()) < va;
+  };
+  return llvm::partition_point(boundaries, isBeforeVA) - boundaries.begin();
 }
 
-// Keep representative insertion points about one MiB apart. This prevents
-// island chains from concentrating at the edge of their branch window.
 void Finalizer::initializePlacementBoundaries() {
   if (!placementBoundaries.empty() || boundaries.empty())
     return;
@@ -469,13 +499,14 @@ Extender *Finalizer::placeThunk(SmallVectorImpl<Extender *> &thunks,
                                 Callee &callee, uint64_t callVA) {
   for (auto *thunk : thunks)
     if (inBranchRange(callVA, thunk->va))
-      return thunk;
+      return thunk; // reuse an existing in-range thunk
   uint32_t begin =
       boundaryBound(subSat(callVA, target->backwardBranchRange), false);
   uint32_t end =
       boundaryBound(addSat(callVA, target->forwardBranchRange), true);
   uint32_t left = boundaryBound(callVA, false);
   uint32_t right = left;
+  // Select the next boundary by probing outward from the callsite.
   auto nextBoundary = [&]() {
     if (left == begin)
       return right++;
@@ -486,15 +517,18 @@ Extender *Finalizer::placeThunk(SmallVectorImpl<Extender *> &thunks,
     return right++;
   };
 
-  while (left != begin || right != end) {
+  std::optional<uint32_t> boundaryIdx;
+  while (!boundaryIdx && (left != begin || right != end)) {
     uint32_t idx = nextBoundary();
-    if (inBranchRange(callVA, proposedExtenderVA(idx))) {
-      Extender *thunk = createExtender(callee, idx, true);
-      thunks.push_back(thunk);
-      return thunk;
-    }
+    if (inBranchRange(callVA, proposedExtenderVA(idx)))
+      boundaryIdx = idx;
   }
-  fatal("cannot place branch thunk for " + toString(*callee.target()));
+  if (!boundaryIdx)
+    fatal("cannot place branch thunk for " + toString(*callee.target()));
+  // Create the thunk at the boundary nearest to callsite 
+  Extender *thunk = createExtender(callee, *boundaryIdx, true);
+  thunks.push_back(thunk);
+  return thunk;
 }
 
 template <typename Fn>
@@ -510,31 +544,36 @@ static void forEachOutward(MutableArrayRef<Callsite> side, bool upper, Fn fn) {
 void Finalizer::planSide(Callee &callee, MutableArrayRef<Callsite> side,
                          bool upper, SmallVectorImpl<Extender *> &thunks,
                          uint64_t targetVA) {
-  Callsite *furthest = side.empty() ? nullptr : upper ? &side.back() : &side[0];
-  if (furthest && !furthest->forceExtender &&
-      inBranchRange(callsiteVA(*furthest), targetVA))
-    furthest = nullptr;
-  if (!furthest && hasForcedCallsites)
-    forEachOutward(side, upper, [&](Callsite &callsite) {
-      if (!furthest && callsite.forceExtender)
-        furthest = &callsite;
-    });
+  if (side.empty())
+    return;
+  Callsite *furthest = upper ? &side.back() : &side.front();
+
+  if (inBranchRange(callsiteVA(*furthest), targetVA)) {
+    if (!hasForcedCallsites)
+      return; // Furthest is range.
+
+    auto outward = llvm::reverse_conditionally(side, upper);
+    auto it = llvm::find_if(outward,
+                            [](const Callsite &c) { return c.forceExtender; });
+    if (it == outward.end())
+      return;
+    furthest = &*it;
+  }
+
   SmallVector<Extender *, 4> islands;
-  if (furthest) {
-    uint64_t callVA = callsiteVA(*furthest);
-    uint64_t anchorVA = targetVA;
-    bool forced = furthest->forceExtender;
-    for (uint32_t depth = 0; (islandOnly || depth != 2) &&
-                             (forced || !inBranchRange(callVA, anchorVA));
-         ++depth) {
-      auto boundaryIdx = findIslandBoundary(callVA, anchorVA);
-      if (!boundaryIdx)
-        break;
-      Extender *island = createExtender(callee, *boundaryIdx, false);
-      islands.push_back(island);
-      anchorVA = island->va;
-      forced = false;
-    }
+  uint64_t callVA = callsiteVA(*furthest);
+  uint64_t anchorVA = targetVA;
+  bool forceExtender = furthest->forceExtender;
+  for (uint32_t depth = 0; (islandOnly || depth != 2) &&
+                           (forceExtender || !inBranchRange(callVA, anchorVA));
+       ++depth) {
+    auto boundaryIdx = findIslandBoundary(callVA, anchorVA);
+    if (!boundaryIdx)
+      break;
+    Extender *island = createExtender(callee, *boundaryIdx, false);
+    islands.push_back(island);
+    anchorVA = island->va;
+    forceExtender = false;
   }
   forEachOutward(side, upper, [&](Callsite &callsite) {
     uint64_t callVA = callsiteVA(callsite);
@@ -549,9 +588,8 @@ void Finalizer::planSide(Callee &callee, MutableArrayRef<Callsite> side,
         bestDistance = distance;
       }
     }
-    if (!islandOnly)
-      if (!callsite.extender)
-        callsite.extender = placeThunk(thunks, callee, callVA);
+    if (!islandOnly && !callsite.extender)
+      callsite.extender = placeThunk(thunks, callee, callVA);
     if (!callsite.extender)
       fatal("cannot route branch to " + toString(*callee.target()));
     callsite.extender->live = true;
@@ -582,6 +620,7 @@ void Finalizer::planCallee(Callee &callee) {
     }
     return;
   }
+  // Split callsites into the address ranges below and above the target.
   auto split = llvm::lower_bound(callee.callsites, *target,
                                  [&](const Callsite &callsite, uint64_t va) {
                                    return callsiteVA(callsite) < va;
@@ -604,21 +643,21 @@ void Finalizer::plan() {
   initializePlacementBoundaries();
   for (auto *callee : callees)
     planCallee(*callee);
-  for (auto *extender : extenders)
-    if (!extender->live)
-      boundaries[extender->boundaryIdx].planned -= extenderSize(*extender);
-  llvm::erase_if(extenders, [](Extender *extender) { return !extender->live; });
+  llvm::erase_if(extenders, [&](Extender *extender) {
+    if (extender->live)
+      return false;
+    boundaries[extender->boundaryIdx].planned -= extenderSize(*extender);
+    return true;
+  });
   llvm::stable_sort(extenders, [](Extender *a, Extender *b) {
     return a->boundaryIdx < b->boundaryIdx;
   });
 }
 
-// Extenders are boundary-ordered. Walking each side from the target outward
-// makes the previously visited island the current island's next branch hop, so
-// the extender does not need to store a redundant extender-to-extender edge.
 template <typename Visitor> bool Finalizer::forEachIslandEdge(Visitor visitor) {
   bool valid = true;
   DenseMap<Callee *, Extender *> inward;
+  // Derive an island's next inward hop on the selected target side.
   auto visit = [&](Extender &extender, bool upper) {
     if (extender.isThunk)
       return;
@@ -628,7 +667,7 @@ template <typename Visitor> bool Finalizer::forEachIslandEdge(Visitor visitor) {
       valid = false;
       return;
     }
-    if ((islandVA > *target) != upper)
+    if ((islandVA > *target) != upper) // check position relativity
       return;
     Extender *nextInward = std::exchange(inward[extender.callee], &extender);
     valid &= visitor(extender, nextInward, *target);
@@ -642,21 +681,23 @@ template <typename Visitor> bool Finalizer::forEachIslandEdge(Visitor visitor) {
 }
 
 bool Finalizer::validate() {
+  // Every island should be in range.
   bool valid = forEachIslandEdge(
       [&](Extender &extender, Extender *inward, uint64_t targetVA) {
         return inBranchRange(extender.va, inward ? inward->va : targetVA);
       });
+  // Every callsite should be reachable to its extender.
   for (auto *callee : callees) {
     auto target = targetVA(*callee);
     for (const auto &callsite : callee->callsites) {
       uint64_t callVA = callsiteVA(callsite);
-      if (callsite.extender) {
+      if (callsite.extender) // An extended call
         valid &= inBranchRange(callVA, callsite.extender->va);
-      } else if (callsite.forceExtender)
-        valid = false;
-      else if (!target)
+      else if (callsite.forceExtender)
+        valid = false; // A forced call without extender
+      else if (!target) // DTrace calls
         valid &= callee->isDtrace();
-      else
+      else // A direct call
         valid &= inBranchRange(callVA, *target);
     }
   }
@@ -665,6 +706,7 @@ bool Finalizer::validate() {
 
 void Finalizer::materialize() {
   DenseMap<Symbol *, std::pair<size_t, size_t>> sequences;
+  // Create the synthetic input section and symbol for one live extender.
   auto create = [&](Extender &extender, size_t sequence) {
     Callee &callee = *extender.callee;
     ConcatInputSection *boundary = boundaries[extender.boundaryIdx].isec;
@@ -677,11 +719,18 @@ void Finalizer::materialize() {
     size_t size = extenderSize(extender);
     if (!isa<Defined>(callee.target()) ||
         cast<Defined>(callee.target())->isExternal())
-      extender.sym = symtab->addDefined(name, nullptr, extender.isec, 0, size,
-                                        false, true, false, false, false);
+      extender.sym = symtab->addDefined(
+          name, /*file=*/nullptr, extender.isec, /*value=*/0, /*size=*/size,
+          /*isWeakDef=*/false, /*isPrivateExtern=*/true,
+          /*isReferencedDynamically=*/false, /*noDeadStrip=*/false,
+          /*isWeakDefCanBeHidden=*/false);
     else
-      extender.sym = make<Defined>(name, nullptr, extender.isec, 0, size, false,
-                                   false, true, true, false, false, false);
+      extender.sym = make<Defined>(
+          name, /*file=*/nullptr, extender.isec, /*value=*/0, /*size=*/size,
+          /*isWeakDef=*/false, /*isExternal=*/false,
+          /*isPrivateExtern=*/true, /*includeInSymtab=*/true,
+          /*isReferencedDynamically=*/false, /*noDeadStrip=*/false,
+          /*canOverrideWeakDef=*/false);
     extender.sym->used = true;
   };
   forEachIslandEdge([&](Extender &extender, Extender *inward, uint64_t) {
@@ -704,6 +753,7 @@ void Finalizer::materialize() {
 
 void Finalizer::run() {
   TimeTraceScope timeScope("Branch extender", name());
+  // Visit each callsite with its currently resolved direct target.
   auto forEachCallsite = [&](auto visitor) {
     for (auto *callee : callees) {
       auto directTarget = targetVA(*callee);
