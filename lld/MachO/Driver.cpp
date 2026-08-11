@@ -2054,12 +2054,6 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
   config->emitRelativeMethodLists = shouldEmitRelativeMethodLists(args);
   config->icfLevel = getICFLevel(args);
   config->branchRangeExtensionMode = getBranchRangeExtensionMode(args);
-  if (auto *arg = args.getLastArg(OPT_branch_island_region_size_eq)) {
-    if (StringRef(arg->getValue()).getAsInteger(0,
-                                                config->branchIslandRegionSize))
-      error("--branch-island-region-size: expected integer, got '" +
-            Twine(arg->getValue()) + "'");
-  }
   config->keepICFStabs = args.hasArg(OPT_keep_icf_stabs);
   config->dedupStrings =
       args.hasFlag(OPT_deduplicate_strings, OPT_no_deduplicate_strings, true);

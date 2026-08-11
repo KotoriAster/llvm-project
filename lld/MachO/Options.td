@@ -93,10 +93,6 @@ def branch_range_extension_eq: Joined<["--"], "branch-range-extension=">,
     HelpText<"Branch range extension strategy (default: thunks)">,
     MetaVarName<"[thunks,islands-slop-free,hybrid]">,
     Group<grp_lld>;
-def branch_island_region_size_eq: Joined<["--"], "branch-island-region-size=">,
-    HelpText<"Size in bytes reserved for branch islands (default: 4194304)">,
-    MetaVarName<"<size>">,
-    Group<grp_lld>;
 def keep_icf_stabs: Joined<["--"], "keep-icf-stabs">,
     HelpText<"Generate STABS entries for symbols folded by ICF. These entries can then be used by dsymutil to discover the address range where folded symbols are located.">,
     Group<grp_lld>;
