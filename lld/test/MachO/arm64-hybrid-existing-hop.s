@@ -1,7 +1,8 @@
 # REQUIRES: aarch64
 
-## Hybrid reuses the first caller's two-island chain. The second caller would
-## require extending it to depth three, so hybrid falls back to a thunk.
+## Callers share the target's two-island spine up to hybrid's depth cap. A
+## caller beyond that spine's reach falls back to a thunk instead of extending
+## the chain to depth three.
 
 # RUN: rm -rf %t; mkdir %t
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %s -o %t/input.o
@@ -14,13 +15,19 @@
 # LOG-SAME: total extenders = 3
 # LOG-NOT: region overflow
 
+# CHECK: <_target.island.0>:
+# CHECK-NEXT: b 0x{{[0-9a-f]+}} <_target>
+# CHECK: <_near_caller>:
+# CHECK-NEXT: bl 0x{{[0-9a-f]+}} <_target.island.0>
+# CHECK: <_target.island.1>:
+# CHECK-NEXT: b 0x{{[0-9a-f]+}} <_target.island.0>
 # CHECK: <_first_caller>:
 # CHECK-NEXT: bl 0x{{[0-9a-f]+}} <_target.island.1>
 # CHECK: <_target.thunk.{{[0-9]+}}>:
 # CHECK-NEXT: adrp x16
 # CHECK-NEXT: add x16, x16
 # CHECK-NEXT: br x16
-# CHECK: <_second_caller>:
+# CHECK: <_far_caller>:
 # CHECK-NEXT: bl 0x{{[0-9a-f]+}} <_target.thunk.{{[0-9]+}}>
 
 .subsections_via_symbols
@@ -31,15 +38,22 @@
 _target:
   ret
 
-## Put _first_caller about 288 MiB after _target. It needs a two-island
-## backward chain, creating reusable hops between itself and _target.
+## The near caller needs the terminal island, and the first caller reaches it
+## through a second island.
 .space 0x6000000
 .globl _f0
 .p2align 2
 _f0:
   ret
 
-.space 0x6000000
+.space 0x3000000
+.globl _near_caller
+.p2align 2
+_near_caller:
+  bl _target
+  ret
+
+.space 0x3000000
 .globl _f1
 .p2align 2
 _f1:
@@ -52,7 +66,7 @@ _first_caller:
   bl _target
   ret
 
-## _second_caller cannot reach the depth-two head and extending the chain would
+## The far caller cannot reach the depth-two head and extending the chain would
 ## exceed hybrid's cap, so it must use a thunk.
 .space 0x6000000
 .globl _f2
@@ -61,8 +75,8 @@ _f2:
   ret
 
 .space 0x6000000
-.globl _second_caller
+.globl _far_caller
 .p2align 2
-_second_caller:
+_far_caller:
   bl _target
   ret

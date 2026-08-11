@@ -22,21 +22,20 @@
 ## when needed.
 # RUN: %lld -arch arm64 -lSystem -o %t/icf-safe %t/input.o --icf=safe_thunks
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/icf-safe | FileCheck %s --check-prefix=SAFE
-# RUN: %lld -arch arm64 -lSystem -o %t/icf-safe-exact %t/input.o \
-# RUN:   --icf=safe_thunks --branch-range-extension=hybrid --verbose \
-# RUN:   2> %t/icf-safe-exact.log
-# RUN: FileCheck %s --check-prefix=EXACT-LOG \
-# RUN:   --input-file=%t/icf-safe-exact.log
-
-## The exact-layout collector must include the synthetic ICF thunk's branch in
-## addition to the two branches from the original input.
-# EXACT-LOG: hybrid branch extender for __TEXT,__text:
-# EXACT-LOG-SAME: total extenders = {{[1-9][0-9]*}}
+# RUN: %lld -arch arm64 -lSystem -o %t/icf-safe-hybrid %t/input.o \
+# RUN:   --icf=safe_thunks --branch-range-extension=hybrid
+# RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn \
+# RUN:   %t/icf-safe-hybrid | FileCheck %s --check-prefixes=SAFE,HYBRID
 
 ## Each call gets its own branch-extension thunk.
 # SAFE-LABEL: <_main>:
 # SAFE:       bl 0x[[#%x, THUNK_A:]] <_target_a.thunk.0>
 # SAFE-NEXT:  bl 0x[[#%x, THUNK_B:]] <_target_b.thunk.0>
+
+## The hybrid exact-layout collector also routes the synthetic ICF thunk's
+## branch through a branch-extension thunk.
+# HYBRID-LABEL: <_target_b>:
+# HYBRID:       b 0x{{[0-9a-f]+}} <_target_a.thunk.1>
 
 .subsections_via_symbols
 

@@ -12,10 +12,12 @@
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/out | FileCheck %s
 
 # LOG: islands-slop-free branch extender for __TEXT,__text:
-# LOG-SAME: total extenders = {{[1-9][0-9]*}}
+# LOG-SAME: total extenders = 2
 
 # CHECK: <_main>:
 # CHECK-NEXT: bl 0x{{[0-9a-f]+}} <_objc_msgSend$foo.island.1>
+# CHECK: <_objc_msgSend$foo.island.1>:
+# CHECK-NEXT: b 0x{{[0-9a-f]+}} <_objc_msgSend$foo.island.0>
 # CHECK: <_objc_msgSend$foo.island.0>:
 # CHECK-NEXT: b 0x{{[0-9a-f]+}} <_objc_msgSend$foo>
 # CHECK: Disassembly of section __TEXT,__objc_stubs:

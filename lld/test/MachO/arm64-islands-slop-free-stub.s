@@ -12,13 +12,15 @@
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/out | FileCheck %s
 
 # LOG: islands-slop-free branch extender for __TEXT,__text:
-# LOG-SAME: total extenders = {{[1-9][0-9]*}}
+# LOG-SAME: total extenders = 2
 
 # CHECK: <_main>:
 # CHECK-NEXT: bl 0x{{[0-9a-f]+}} <_external.island.1>
+# CHECK: <_external.island.1>:
+# CHECK-NEXT: b 0x{{[0-9a-f]+}} <_external.island.0>
 # CHECK: <_external.island.0>:
-# CHECK-NEXT: b 0x{{[0-9a-f]+}} <{{.*}}>
-# CHECK: <__stubs>:
+# CHECK-NEXT: b 0x[[#%x, STUB:]] <{{.*}}>
+# CHECK: [[#STUB]] <__stubs>:
 # CHECK-NEXT: adrp x16
 # CHECK-NEXT: ldr x16
 # CHECK-NEXT: br x16
