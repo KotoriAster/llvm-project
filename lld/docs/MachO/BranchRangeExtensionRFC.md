@@ -126,7 +126,7 @@ decisions, facts, and addresses apart is what makes a proposal disposable.
 | Structure | Lifetime | Holds | Mutable across passes? |
 |---|---|---|---|
 | `FinalizerContext` | whole finalization | topology + fixed-point memory | only the two monotonic facts |
-| `ExtensionProposal` | one pass | the extender graph + routing | rebuilt every pass |
+| `ExtensionProposal` | one pass | the extender graph + callsite routing | rebuilt every pass |
 | `ExtensionLayout` | one pass | derived addresses | recomputed every pass |
 
 ### 3.1 `FinalizerContext` — facts and cross-pass memory
@@ -156,7 +156,7 @@ A disposable graph produced by one planning pass:
 - `extenders`: the islands and thunks to create,
   each recording its kind, the callee it serves, its boundary, and (for a relay
   island) the next island in its chain.
-- `routing`: for each callsite, which extender it uses, in callee-major
+- `callsites2extenders`: for each callsite, which extender it uses, in callee-major
   callsite order. A sentinel means "stays direct."
 - `desiredExtra`: how many extender bytes each boundary actually wants, the
   signal used to grow the reservation.

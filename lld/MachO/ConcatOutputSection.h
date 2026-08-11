@@ -19,6 +19,7 @@
 namespace lld::macho {
 
 enum class BranchRangeExtensionMode;
+class Finalizer;
 
 // Linking multiple files will inevitably mean resolving sections in different
 // files that are labeled with the same segment and section name. This class
@@ -100,6 +101,7 @@ public:
   }
 
 private:
+  friend class Finalizer;
   void finalizeWithExtenders(BranchRangeExtensionMode);
 
   std::vector<ConcatInputSection *> thunks;
