@@ -209,7 +209,6 @@ struct Configuration {
   ICFLevel icfLevel = ICFLevel::none;
   BranchRangeExtensionMode branchRangeExtensionMode =
       BranchRangeExtensionMode::thunks;
-  uint64_t branchIslandRegionSize = 4 * 1024 * 1024;
   bool keepICFStabs = false;
   ObjCStubsMode objcStubsMode = ObjCStubsMode::fast;
   llvm::MachO::HeaderFileType outputType;
