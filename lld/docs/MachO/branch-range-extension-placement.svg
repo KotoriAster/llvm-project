@@ -1,0 +1,151 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="410"
+     viewBox="0 0 1100 410" role="img"
+     aria-labelledby="title description">
+  <title id="title">Branch extender placement algorithms</title>
+  <desc id="description">
+    Four aligned rows compare existing Mach-O thunk placement, fixed-reserve
+    island placement, ELF thunk-section placement, and the proposed
+    callee-centric placement. C denotes a caller, I an island, K a thunk, and T
+    the target.
+  </desc>
+
+  <defs>
+    <marker id="blue-arrow" markerWidth="8" markerHeight="8" refX="7"
+            refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 8 4 L 0 8 z" fill="#2563eb"/>
+    </marker>
+    <marker id="orange-arrow" markerWidth="8" markerHeight="8" refX="7"
+            refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 8 4 L 0 8 z" fill="#c2410c"/>
+    </marker>
+    <pattern id="reserve" width="8" height="8" patternUnits="userSpaceOnUse"
+             patternTransform="rotate(45)">
+      <rect width="8" height="8" fill="#e5e7eb"/>
+      <line y2="8" stroke="#cbd5e1" stroke-width="3"/>
+    </pattern>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .algorithm { fill: #111827; font-size: 16px; font-weight: 650; }
+      .hint { fill: #64748b; font-size: 11px; }
+      .track { stroke: #94a3b8; stroke-width: 8; }
+      .boundary { stroke: #cbd5e1; stroke-width: 1.5; }
+      .caller { fill: #ffffff; stroke: #2563eb; stroke-width: 2; }
+      .island { fill: #dbeafe; stroke: #2563eb; stroke-width: 2; }
+      .thunk { fill: #ffedd5; stroke: #c2410c; stroke-width: 2; }
+      .target { fill: #dcfce7; stroke: #15803d; stroke-width: 2; }
+      .node-text { fill: #1f2937; font-size: 12px; text-anchor: middle; }
+      .direct { fill: none; stroke: #2563eb; stroke-width: 2;
+                marker-end: url(#blue-arrow); }
+      .indirect { fill: none; stroke: #c2410c; stroke-width: 2;
+                  stroke-dasharray: 6 4; marker-end: url(#orange-arrow); }
+      .thunk-section { fill: #fef3c7; fill-opacity: 0.75;
+                       stroke: #d97706; stroke-width: 1.5; }
+      .fixed-reserve { fill: url(#reserve); stroke: #94a3b8;
+                       stroke-width: 1.5; stroke-dasharray: 4 3; }
+    </style>
+  </defs>
+
+  <rect width="1100" height="410" fill="#ffffff"/>
+
+  <!-- Shared one-line layout skeletons. -->
+  <g>
+    <line x1="250" y1="65" x2="1060" y2="65" class="track"/>
+    <line x1="250" y1="155" x2="1060" y2="155" class="track"/>
+    <line x1="250" y1="245" x2="1060" y2="245" class="track"/>
+    <line x1="250" y1="345" x2="1060" y2="345" class="track"/>
+    <g class="boundary">
+      <path d="M270 51V79 M350 51V79 M430 51V79 M510 51V79 M590 51V79
+               M670 51V79 M750 51V79 M830 51V79 M910 51V79 M990 51V79"/>
+      <path d="M270 141V169 M350 141V169 M430 141V169 M510 141V169
+               M590 141V169 M670 141V169 M750 141V169 M830 141V169
+               M910 141V169 M990 141V169"/>
+      <path d="M270 231V259 M350 231V259 M430 231V259 M510 231V259
+               M590 231V259 M670 231V259 M750 231V259 M830 231V259
+               M910 231V259 M990 231V259"/>
+      <path d="M270 331V359 M350 331V359 M430 331V359 M510 331V359
+               M590 331V359 M670 331V359 M750 331V359 M830 331V359
+               M910 331V359 M990 331V359"/>
+    </g>
+  </g>
+
+  <!-- Existing Mach-O: the active thunk is emitted at the scan frontier. -->
+  <g>
+    <text x="30" y="61" class="algorithm">Existing Mach-O thunks</text>
+    <text x="30" y="78" class="hint">single pass · fixed slop</text>
+    <circle cx="310" cy="65" r="13" class="caller"/>
+    <text x="310" y="69" class="node-text">C</text>
+    <rect x="604" y="48" width="34" height="34" rx="4" class="thunk"/>
+    <text x="621" y="69" class="node-text">K</text>
+    <polygon points="930,45 945,65 930,85 915,65" class="target"/>
+    <text x="930" y="69" class="node-text">T</text>
+    <path d="M323 65H602" class="direct"/>
+    <path d="M638 54C720 12 862 12 918 48" class="indirect"/>
+  </g>
+
+  <!-- Existing islands: islands are packed into a fixed reserved region. -->
+  <g>
+    <text x="30" y="151" class="algorithm">Existing islands mode</text>
+    <text x="30" y="168" class="hint">fixed reserved island region</text>
+    <rect x="555" y="132" width="170" height="46" rx="4"
+          class="fixed-reserve"/>
+    <circle cx="310" cy="155" r="13" class="caller"/>
+    <text x="310" y="159" class="node-text">C</text>
+    <circle cx="590" cy="155" r="14" class="island"/>
+    <text x="590" y="159" class="node-text">I</text>
+    <circle cx="670" cy="155" r="14" class="island"/>
+    <text x="670" y="159" class="node-text">I</text>
+    <polygon points="930,135 945,155 930,175 915,155" class="target"/>
+    <text x="930" y="159" class="node-text">T</text>
+    <path d="M323 155H574" class="direct"/>
+    <path d="M606 155H654" class="direct"/>
+    <path d="M686 155H913" class="direct"/>
+  </g>
+
+  <!-- ELF: pre-spaced thunk containers, with a caller-local fallback. -->
+  <g>
+    <text x="30" y="241" class="algorithm">ELF lld thunks</text>
+    <text x="30" y="258" class="hint">pre-spaced ThunkSections</text>
+    <rect x="430" y="218" width="54" height="54" class="thunk-section"/>
+    <rect x="750" y="218" width="54" height="54" class="thunk-section"/>
+    <rect x="440" y="228" width="34" height="34" rx="4" class="thunk"/>
+    <text x="457" y="249" class="node-text">K</text>
+    <circle cx="550" cy="245" r="13" class="caller"/>
+    <text x="550" y="249" class="node-text">C</text>
+    <polygon points="930,225 945,245 930,265 915,245" class="target"/>
+    <text x="930" y="249" class="node-text">T</text>
+    <path d="M537 245H476" class="direct"/>
+    <path d="M474 229C575 188 837 188 918 228" class="indirect"/>
+  </g>
+
+  <!-- Proposed: one outward chain per callee side, with thunk fallback. -->
+  <g>
+    <text x="30" y="341" class="algorithm">Proposed callee-centric</text>
+    <text x="30" y="358" class="hint">shared outward chains · nearest thunk fallback</text>
+    <circle cx="270" cy="345" r="13" class="caller"/>
+    <text x="270" y="349" class="node-text">C</text>
+    <rect x="314" y="328" width="34" height="34" rx="4" class="thunk"/>
+    <text x="331" y="349" class="node-text">K</text>
+    <circle cx="390" cy="345" r="13" class="caller"/>
+    <text x="390" y="349" class="node-text">C</text>
+    <circle cx="470" cy="345" r="14" class="island"/>
+    <text x="470" y="349" class="node-text">I</text>
+    <circle cx="550" cy="345" r="14" class="island"/>
+    <text x="550" y="349" class="node-text">I</text>
+    <polygon points="650,325 665,345 650,365 635,345" class="target"/>
+    <text x="650" y="349" class="node-text">T</text>
+    <circle cx="750" cy="345" r="14" class="island"/>
+    <text x="750" y="349" class="node-text">I</text>
+    <circle cx="830" cy="345" r="14" class="island"/>
+    <text x="830" y="349" class="node-text">I</text>
+    <circle cx="990" cy="345" r="13" class="caller"/>
+    <text x="990" y="349" class="node-text">C</text>
+    <path d="M283 345H312" class="direct"/>
+    <path d="M348 333C430 291 573 291 638 328" class="indirect"/>
+    <path d="M403 345H454" class="direct"/>
+    <path d="M486 345H534" class="direct"/>
+    <path d="M566 345H633" class="direct"/>
+    <path d="M977 345H846" class="direct"/>
+    <path d="M814 345H766" class="direct"/>
+    <path d="M734 345H667" class="direct"/>
+  </g>
+</svg>
