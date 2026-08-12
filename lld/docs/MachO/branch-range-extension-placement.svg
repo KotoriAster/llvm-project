@@ -70,7 +70,7 @@
 
   <!-- Existing Mach-O: the active thunk is emitted at the scan frontier. -->
   <g>
-    <text x="30" y="61" class="algorithm">Existing Mach-O thunks</text>
+    <text x="30" y="61" class="algorithm">current MachO port thunks</text>
     <text x="30" y="78" class="hint">single pass · fixed slop</text>
     <circle cx="310" cy="65" r="13" class="caller"/>
     <text x="310" y="69" class="node-text">C</text>
@@ -82,9 +82,9 @@
     <path d="M638 54C720 12 862 12 918 48" class="indirect"/>
   </g>
 
-  <!-- Existing islands: islands are packed into a fixed reserved region. -->
+  <!-- ld64-style islands are packed into a fixed reserved region. -->
   <g>
-    <text x="30" y="151" class="algorithm">Existing islands mode</text>
+    <text x="30" y="151" class="algorithm">ld64 style islands</text>
     <text x="30" y="168" class="hint">fixed reserved island region</text>
     <rect x="555" y="132" width="170" height="46" rx="4"
           class="fixed-reserve"/>
@@ -119,7 +119,7 @@
 
   <!-- Proposed: one outward chain per callee side, with thunk fallback. -->
   <g>
-    <text x="30" y="341" class="algorithm">Proposed callee-centric</text>
+    <text x="30" y="341" class="algorithm">maxHops=2 / maxHops=inf</text>
     <text x="30" y="358" class="hint">shared outward chains · nearest thunk fallback</text>
     <circle cx="270" cy="345" r="13" class="caller"/>
     <text x="270" y="349" class="node-text">C</text>
