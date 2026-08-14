@@ -744,7 +744,7 @@ void TextOutputSection::Finalizer::materialize() {
       llvm::all_of(extenders,
                    [](const Extender *extender) { return extender->live; }) &&
       "only live extenders may be materialized");
-  DenseMap<Symbol *, std::pair<size_t, size_t>> sequences;
+  DenseMap<Callee *, std::pair<size_t, size_t>> sequences;
   // Create the synthetic input section and symbol for one live extender.
   auto create = [&](Extender &extender, size_t sequence) {
     Callee &callee = *extender.callee;
@@ -753,8 +753,12 @@ void TextOutputSection::Finalizer::materialize() {
         makeSyntheticInputSection(boundary->getSegName(), boundary->getName());
     extender.isec->parent = boundary->parent;
     StringRef kind = extender.isThunk ? ".thunk." : ".island.";
-    StringRef name = saver().save(callee.target()->getName() + kind +
-                                  std::to_string(sequence));
+    std::string addendSuffix;
+    if (callee.addend() != 0)
+      addendSuffix = (callee.addend() > 0 ? "+" : "") +
+                     std::to_string(callee.addend());
+    StringRef name = saver().save(callee.target()->getName() + addendSuffix +
+                                  kind + std::to_string(sequence));
     size_t size = extender.size();
     if (!isa<Defined>(callee.target()) ||
         cast<Defined>(callee.target())->isExternal())
@@ -774,7 +778,7 @@ void TextOutputSection::Finalizer::materialize() {
   };
   forEachIslandEdge([&](Extender &extender, Extender *inward) {
     Callee &callee = *extender.callee;
-    create(extender, sequences[callee.target()].first++);
+    create(extender, sequences[&callee].first++);
     target->populateIsland(extender.isec,
                            inward ? inward->sym : callee.target());
     extender.isec->relocs[0].addend = inward ? 0 : callee.addend();
@@ -783,7 +787,7 @@ void TextOutputSection::Finalizer::materialize() {
   for (auto *extender : extenders)
     if (extender->isThunk) {
       Callee &callee = *extender->callee;
-      create(*extender, sequences[callee.target()].second++);
+      create(*extender, sequences[&callee].second++);
       if (needsBinding(callee.target()))
         assert(callee.target()->isInStubs() &&
                "stub should have been inserted before finalization");
