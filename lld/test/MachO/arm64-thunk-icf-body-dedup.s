@@ -20,10 +20,11 @@
 
 ## Verify that safe_thunks ICF still creates separate branch-extension thunks
 ## when needed.
-# RUN: %lld -arch arm64 -lSystem -o %t/icf-safe %t/input.o --icf=safe_thunks
+# RUN: %lld -arch arm64 -lSystem -o %t/icf-safe %t/input.o --icf=safe_thunks \
+# RUN:   --branch-range-extension-max-hops=0
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/icf-safe | FileCheck %s --check-prefix=SAFE
 # RUN: %lld -arch arm64 -lSystem -o %t/icf-safe-hybrid %t/input.o \
-# RUN:   --icf=safe_thunks --branch-range-extension=hybrid
+# RUN:   --icf=safe_thunks --branch-range-extension-max-hops=2
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn \
 # RUN:   %t/icf-safe-hybrid | FileCheck %s --check-prefixes=SAFE,HYBRID
 

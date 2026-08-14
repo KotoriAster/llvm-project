@@ -1,43 +1,59 @@
 # REQUIRES: aarch64
 
-## Verify the emitted artifact, rather than only planner diagnostics, matches
-## each branch-range extension policy:
-##
-##   thunks:            every out-of-range call uses a thunk;
-##   hybrid:            up to two islands are allowed, then a thunk is used;
-##   islands-slop-free: arbitrarily long island chains are allowed.
-##
 ## The three-hop cases exercise targets above and below their callers.
+##
+## Final address columns relative to _main 
+##
+##   0                 ~+96 MiB       ~+192 MiB      ~+288 MiB      ~+384 MiB
+##   |                     |               |              |              |
+## _three_hop_down/   extenders/      extenders/    extenders/    _three_hop/
+## _main              _boundary0      _one_hop      _two_hop      _downward_main
+##
+## Representative branch paths (`=>` is a thunk's indirect jump):
+## `one`, `two`, `three`, and `down` abbreviate the corresponding symbols;
+## `.iN` abbreviates `.island.N`.
+##
+##   maxHops=0:   _main --> {one,two,three}.thunk.0 => each target
+##                 down target <= down.thunk.0 <-- _downward_main
+##
+##   maxHops=2:   _main --> one.i0 --------------------> _one_hop
+##                      --> two.i1 --> two.i0 ----------> _two_hop
+##                      --> three.thunk.0 =============> _three_hop
+##                 down target <= down.thunk.0 <-------- _downward_main
+##
+##   maxHops=inf: _main --> three.i2 --> three.i1 --> three.i0 --> _three_hop
+##                 down target <-- down.i0 <-- down.i1 <-- down.i2 <-- down main
 
 # RUN: rm -rf %t; mkdir %t
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %s -o %t/input.o
 
 # RUN: %lld -arch arm64 -dylib -o %t/thunks %t/input.o \
-# RUN:   --branch-range-extension=thunks --verbose 2> %t/thunks.log
+# RUN:   --branch-range-extension-max-hops=0 --verbose 2> %t/thunks.log
 # RUN: FileCheck %s --check-prefix=THUNKS-LOG --input-file=%t/thunks.log
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/thunks \
 # RUN:   | FileCheck %s --check-prefix=THUNKS
 # RUN: rm %t/thunks
 
 # RUN: %lld -arch arm64 -dylib -o %t/hybrid %t/input.o \
-# RUN:   --branch-range-extension=hybrid --verbose 2> %t/hybrid.log
+# RUN:   --branch-range-extension-max-hops=2 --verbose 2> %t/hybrid.log
 # RUN: FileCheck %s --check-prefix=HYBRID-LOG --input-file=%t/hybrid.log
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/hybrid \
 # RUN:   | FileCheck %s --check-prefix=HYBRID
 # RUN: rm %t/hybrid
 
 # RUN: %lld -arch arm64 -dylib -o %t/islands %t/input.o \
-# RUN:   --branch-range-extension=islands-slop-free --verbose \
+# RUN:   --branch-range-extension-max-hops=4294967295 --verbose \
 # RUN:   2> %t/islands.log
 # RUN: FileCheck %s --check-prefix=ISLANDS-LOG --input-file=%t/islands.log
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/islands \
 # RUN:   | FileCheck %s --check-prefix=ISLANDS
 # RUN: rm %t/islands
 
-# THUNKS-LOG: Created 4 {{.*}} thunks and updated 4 branch targets
-# HYBRID-LOG: hybrid branch extender for __TEXT,__text:
+# THUNKS-LOG: maxHops=0 branch extender for __TEXT,__text:
+# THUNKS-LOG-SAME: total extenders = 4
+# HYBRID-LOG: maxHops=2 branch extender for __TEXT,__text:
 # HYBRID-LOG-SAME: total extenders = 5
-# ISLANDS-LOG: islands-slop-free branch extender for __TEXT,__text:
+# ISLANDS-LOG: maxHops=4294967295 branch extender for __TEXT,__text:
 # ISLANDS-LOG-SAME: total extenders = 9
 
 # THUNKS-LABEL: <_main>:
@@ -48,17 +64,21 @@
 # THUNKS-NEXT: adrp x16
 # THUNKS-NEXT: add x16, x16
 # THUNKS-NEXT: br x16
-# THUNKS: <_downward_main>:
-# THUNKS-NEXT: bl 0x{{[0-9a-f]+}} <_three_hop_down.thunk.0>
+# THUNKS: <_two_hop.thunk.0>:
+# THUNKS-NEXT: adrp x16
+# THUNKS-NEXT: add x16, x16
+# THUNKS-NEXT: br x16
+# THUNKS: <_three_hop.thunk.0>:
+# THUNKS-NEXT: adrp x16
+# THUNKS-NEXT: add x16, x16
+# THUNKS-NEXT: br x16
 # THUNKS: <_three_hop_down.thunk.0>:
 # THUNKS-NEXT: adrp x16
 # THUNKS-NEXT: add x16, x16
 # THUNKS-NEXT: br x16
+# THUNKS: <_downward_main>:
+# THUNKS-NEXT: bl 0x{{[0-9a-f]+}} <_three_hop_down.thunk.0>
 
-# HYBRID: <_three_hop.thunk.0>:
-# HYBRID-NEXT: adrp x16
-# HYBRID-NEXT: add x16, x16
-# HYBRID-NEXT: br x16
 # HYBRID-LABEL: <_main>:
 # HYBRID-NEXT: bl 0x{{[0-9a-f]+}} <_one_hop.island.0>
 # HYBRID-NEXT: bl 0x{{[0-9a-f]+}} <_two_hop.island.1>
@@ -67,6 +87,10 @@
 # HYBRID-NEXT: b 0x{{[0-9a-f]+}} <_one_hop>
 # HYBRID: <_two_hop.island.1>:
 # HYBRID-NEXT: b 0x{{[0-9a-f]+}} <_two_hop.island.0>
+# HYBRID: <_three_hop.thunk.0>:
+# HYBRID-NEXT: adrp x16
+# HYBRID-NEXT: add x16, x16
+# HYBRID-NEXT: br x16
 # HYBRID: <_two_hop.island.0>:
 # HYBRID-NEXT: b 0x{{[0-9a-f]+}} <_two_hop>
 # HYBRID: <_three_hop_down.thunk.0>:

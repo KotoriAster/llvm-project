@@ -1,9 +1,17 @@
 # REQUIRES: aarch64
 
 ## _target has a nonzero value in its input section and _alias has the same
-## effective address. Collection must merge both calls into one destination
-## group, and layout must recover the target value from Defined rather than
-## storing a duplicate targetValue in persistent state.
+## effective address.
+##
+## Layout of the regression test
+##
+##   0                 +0x600000c       +0x7fffffc       +0xc000010  +0xc000050
+##   |                       |                |                 |          |
+## _main             _target.island.0  direct BL limit  target inputVA  targetVA
+##   |---------------------->|                                  + 64 B -->|
+##   |  both calls, ~96 MiB  |------------------------------------------->|
+##                            island branch, ~96 MiB         _target == _alias
+##
 
 # RUN: rm -rf %t; mkdir %t
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin -defsym CALLER=1 \
@@ -15,13 +23,13 @@
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin -defsym TARGET=1 \
 # RUN:   %s -o %t/target.o
 # RUN: %lld -arch arm64 -dylib -o %t/out %t/caller.o %t/pad0.o %t/pad1.o \
-# RUN:   %t/target.o --branch-range-extension=hybrid --verbose \
+# RUN:   %t/target.o --branch-range-extension-max-hops=2 --verbose \
 # RUN:   2> %t/link.log
 # RUN: FileCheck %s --check-prefix=LOG --input-file=%t/link.log
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/out \
 # RUN:   | FileCheck %s --check-prefix=DIS
 
-# LOG: hybrid branch extender for __TEXT,__text:
+# LOG: maxHops=2 branch extender for __TEXT,__text:
 # LOG-SAME: targets = 1
 # LOG-SAME: total extenders = 1
 

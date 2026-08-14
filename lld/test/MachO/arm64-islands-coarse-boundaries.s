@@ -7,12 +7,12 @@
 # RUN: rm -rf %t; mkdir %t
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %s -o %t/input.o
 # RUN: %lld -arch arm64 -dylib -o %t/out %t/input.o \
-# RUN:   --branch-range-extension=islands-slop-free --verbose 2> %t/link.log
+# RUN:   --branch-range-extension-max-hops=4294967295 --verbose 2> %t/link.log
 # RUN: FileCheck %s --check-prefix=LOG --input-file=%t/link.log
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/out \
 # RUN:   | FileCheck %s
 
-# LOG: islands-slop-free branch extender for __TEXT,__text: passes = 1
+# LOG: maxHops=4294967295 branch extender for __TEXT,__text: passes = 1
 # LOG-SAME: total extenders = 1
 
 # CHECK-LABEL: <_main>:
