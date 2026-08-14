@@ -89,9 +89,11 @@ def icf_eq: Joined<["--"], "icf=">,
             "  all         - Fold all identical functions">,
     MetaVarName<"[none,safe,safe_thunks,all]">,
     Group<grp_lld>;
-def branch_range_extension_eq: Joined<["--"], "branch-range-extension=">,
-    HelpText<"Branch range extension strategy (default: thunks)">,
-    MetaVarName<"[thunks,islands-slop-free,hybrid]">,
+def branch_range_extension_max_hops_eq
+    : Joined<["--"], "branch-range-extension-max-hops=">,
+    HelpText<"Maximum number of branch-island hops before falling back to a "
+             "thunk (default: 2)">,
+    MetaVarName<"<non-negative integer>">,
     Group<grp_lld>;
 def keep_icf_stabs: Joined<["--"], "keep-icf-stabs">,
     HelpText<"Generate STABS entries for symbols folded by ICF. These entries can then be used by dsymutil to discover the address range where folded symbols are located.">,
@@ -1109,15 +1111,6 @@ defm tail_merge_strings
     : BB<"tail-merge-strings", "Enable string tail merging",
          "Disable string tail merging to improve link-time performance">,
       Group<grp_rare>;
-def slop_scale_eq
-    : Joined<["--"], "slop_scale=">,
-      MetaVarName<"<unsigned_int>">,
-      HelpText<"Specify the slop scale. Default value is 256. If your binary "
-               "has too many consecutive branch instructions resulting in "
-               "thunk-range overrun, then you need to increase this value to a "
-               "higher value, such as 512 or 1024, etc">,
-      Group<grp_rare>;
-
 def grp_deprecated : OptionGroup<"deprecated">, HelpText<"DEPRECATED">;
 
 def lazy_framework : Separate<["-"], "lazy_framework">,
