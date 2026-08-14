@@ -1052,21 +1052,19 @@ static ICFLevel getICFLevel(const ArgList &args) {
   return icfLevel;
 }
 
-static BranchRangeExtensionMode
-getBranchRangeExtensionMode(const ArgList &args) {
-  StringRef modeStr = args.getLastArgValue(OPT_branch_range_extension_eq);
-  auto mode = StringSwitch<BranchRangeExtensionMode>(modeStr)
-                  .Cases({"thunks", ""}, BranchRangeExtensionMode::thunks)
-                  .Case("islands-slop-free",
-                        BranchRangeExtensionMode::islandsSlopFree)
-                  .Case("hybrid", BranchRangeExtensionMode::hybrid)
-                  .Default(BranchRangeExtensionMode::thunks);
-  if (mode == BranchRangeExtensionMode::thunks && !modeStr.empty() &&
-      modeStr != "thunks") {
-    warn(Twine("unknown --branch-range-extension=OPTION `") + modeStr +
-         "', defaulting to `thunks'");
+static uint32_t getBranchRangeExtensionMaxHops(const ArgList &args) {
+  const Arg *arg = args.getLastArg(OPT_branch_range_extension_max_hops_eq);
+  if (!arg)
+    return 2;
+
+  StringRef value = arg->getValue();
+  uint32_t maxHops;
+  if (!llvm::to_integer(value, maxHops)) {
+    error(arg->getSpelling() +
+          ": expected a non-negative integer, but got '" + value + "'");
+    return 2;
   }
-  return mode;
+  return maxHops;
 }
 
 static ObjCStubsMode getObjCStubsMode(const ArgList &args) {
@@ -1800,7 +1798,6 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
     loadedObjectFrameworks.clear();
     missingAutolinkWarnings.clear();
     syntheticSections.clear();
-    thunkMap.clear();
     unprocessedLCLinkerOptions.clear();
     ObjCSelRefsHelper::cleanup();
 
@@ -2053,7 +2050,7 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
       config->emitChainedFixups || args.hasArg(OPT_init_offsets);
   config->emitRelativeMethodLists = shouldEmitRelativeMethodLists(args);
   config->icfLevel = getICFLevel(args);
-  config->branchRangeExtensionMode = getBranchRangeExtensionMode(args);
+  config->branchRangeExtensionMaxHops = getBranchRangeExtensionMaxHops(args);
   config->keepICFStabs = args.hasArg(OPT_keep_icf_stabs);
   config->dedupStrings =
       args.hasFlag(OPT_deduplicate_strings, OPT_no_deduplicate_strings, true);
@@ -2090,15 +2087,6 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
                    OPT_no_separate_cstring_literal_sections, false);
   config->tailMergeStrings =
       args.hasFlag(OPT_tail_merge_strings, OPT_no_tail_merge_strings, false);
-  if (auto *arg = args.getLastArg(OPT_slop_scale_eq)) {
-    StringRef v(arg->getValue());
-    unsigned slop = 0;
-    if (!llvm::to_integer(v, slop))
-      error(arg->getSpelling() +
-            ": expected a non-negative integer, but got '" + v + "'");
-    config->slopScale = slop;
-  }
-
   auto IncompatWithCGSort = [&](StringRef firstArgStr) {
     // Throw an error only if --call-graph-profile-sort is explicitly specified
     if (config->callGraphProfileSort)

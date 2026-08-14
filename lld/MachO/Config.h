@@ -25,6 +25,7 @@
 #include "llvm/TextAPI/Platform.h"
 #include "llvm/TextAPI/Target.h"
 
+#include <cstdint>
 #include <vector>
 
 namespace llvm {
@@ -71,13 +72,6 @@ enum class ICFLevel {
   safe,
   safe_thunks,
   all,
-};
-
-enum class BranchRangeExtensionMode {
-  thunks,  // 12-byte adrp+add+br x16 (corrupts x16)
-  islandsSlopFree, // target-anchored, exact-layout island-only planner
-  hybrid,      // at most two islands from the callee in either direction, then
-               // a 12-byte thunk for longer jumps
 };
 
 enum class ObjCStubsMode {
@@ -207,8 +201,7 @@ struct Configuration {
   UndefinedSymbolTreatment undefinedSymbolTreatment =
       UndefinedSymbolTreatment::error;
   ICFLevel icfLevel = ICFLevel::none;
-  BranchRangeExtensionMode branchRangeExtensionMode =
-      BranchRangeExtensionMode::thunks;
+  uint32_t branchRangeExtensionMaxHops = 2;
   bool keepICFStabs = false;
   ObjCStubsMode objcStubsMode = ObjCStubsMode::fast;
   llvm::MachO::HeaderFileType outputType;
@@ -235,7 +228,6 @@ struct Configuration {
   bool disableVerify;
   bool separateCstringLiteralSections;
   bool tailMergeStrings;
-  unsigned slopScale = 256;
 
   bool callGraphProfileSort = false;
   llvm::StringRef printSymbolOrder;
