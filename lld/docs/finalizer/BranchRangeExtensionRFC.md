@@ -94,67 +94,34 @@ App2 copy-on-write faults:
 
 ## Proposed algorithm
 
-The proposed finalizer is a slop-free hybrid that uses compact islands where
-possible and falls back to thunks when greater reach is required. It eliminates
-fixed slop by learning how much extender space is required at each insertion
-boundary. An ELF-style multipass algorithm builds shared island and thunk
-routes for callsites that have the same callee.
+The key to eliminating fixed slop is to replace its global estimate with a
+per-boundary `reservedExtra` value learned during finalization. The hybrid uses
+an ELF-style multipass algorithm because inserting an island or thunk shifts
+later addresses and may push other branches out of range. Unlike ELF, which
+retains the concrete thunks and `ThunkSection`s created by earlier passes, this
+algorithm replans the islands and thunks on every pass against the layout
+defined by `reservedExtra`. If a proposal fails validation, only the required
+reservation at each boundary is retained for the next pass. Once a proposal
+validates, only its live extenders are emitted.
 
-The previous single-pass finalizer had to reserve slop before the actual thunk
-demand was known. This reservation reduced the usable branch range but could
-still be insufficient. The new finalizer starts with no reserved space. If a
-proposal fails validation, the finalizer increases the reservation only at the
-boundaries where the proposal needed more space. The next pass then plans
-against the updated reservation layout. Once a proposal validates, its live
-extenders replace the reservations, and unused reserved space is not emitted.
-Thus, reservations are learned from actual failures instead of being set by a
-global estimate or `--slop_scale`.
+A stable reservation layout gives every callsite and callee a stable virtual
+address within a pass. Because proposed extenders do not disturb these
+addresses, each callee can be planned against the same fixed layout without
+recomputing the effects of other callee groups.
 
-The multipass design is necessary because inserting an extender shifts later
-addresses and may invalidate branches that were previously in range. Each pass
-therefore builds a proposal, computes its exact layout, and validates every
-direct and extended branch edge. The proposed default, `maxHops=2`, allows the
-hybrid to use up to two 4-byte island hops before falling back to a 12-byte
-thunk. Two islands use less code than one thunk while keeping the expected
-number of additional page-ins below two.
+As a result, only the farthest callsite on each side of a callee needs to drive
+island placement. An island chain built to reach that callsite also covers the
+nearer callsites, which can reuse reachable islands instead of planning chains
+of their own. The planner places each island as far outward from the callee as
+its inward hop permits, maximizing the additional callsite range covered by
+that hop. When thunk fallback is required, it places the thunk at the inward
+edge of the furthest callsite's branch window. Nearer callsites can then reuse
+the thunk without coupling universal-thunk placement to the island spine.
+Together, these choices improve sharing and reduce the total extender
+contribution.
 
-Unlike ELF, which iterates over the `ThunkSection`s inserted by earlier passes,
-this algorithm iterates over reserved space. Each pass freezes one reservation
-layout and plans every callee against it. If the proposal is rejected, all
-placement choices are discarded; only the required space at each boundary is
-retained. As a result, every planner in a pass uses the same stable coordinate
-system, failed placement choices do not constrain later passes, and extender
-sharing can be reconsidered on each pass. Reservations and forced-call state
-only grow, so each rejection makes monotonic progress toward convergence.
-
-Planning is organized by callee so that callsites with the same effective
-target can share extenders. Once the reservation layout fixes the callee and
-callsite addresses, the farthest callsite on each side of the callee determines
-the region to cover. The planner builds an island chain outward from the
-callee, routes nearer callsites through reachable islands, and reuses an
-in-range thunk when a fallback is needed. It then removes any unused
-candidates. This coverage-driven approach avoids duplicate extenders and makes
-the result independent of callsite visitation order.
-
-The algorithms also differ in how they place an in-range extender:
-
-| Algorithm | Placement |
-|---|---|
-| Previous Mach-O finalizer | Places a thunk near the forward edge of a waiting callsite's range and protects the placement with fixed slop |
-| ld64-style islands | Packs islands into a fixed reserved region rather than choosing a position from the caller and callee |
-| ELF | Prefers an existing, pre-spaced `ThunkSection` in range; otherwise places one beside the callsite |
-| Proposed finalizer | Places an island as far toward the most distant callsite as the hop back toward the callee permits; reuses an in-range thunk or places one at the legal boundary nearest an uncovered callsite |
-
-These choices reflect each algorithm's planning unit. The previous Mach-O
-finalizer scans callsites in layout order, so it places an active thunk near the
-forward limit of the branch range. This increases reuse by later callsites at
-the cost of fixed slop. ELF uses pre-spaced containers to serve many callers
-and adds a caller-local container only when no existing container is reachable.
-
-The proposed finalizer instead optimizes coverage for one callee at a time. It
-places each island outward from the callee to maximize the additional callsite
-range covered by that hop. To distribute chains, the planner first considers
-insertion boundaries spaced approximately 1 MiB apart, then falls back to any
-exact input boundary. Because a thunk can reach its callee indirectly from
-anywhere, the planner places a new thunk at the legal boundary nearest the
-callsite, maximizing the branch's range margin.
+By contrast, ELF and the previous Mach-O thunk finalizer use callsite-guided
+planning. They walk callsites and find or create a reachable thunk as each
+out-of-range branch is encountered. The proposed finalizer instead walks
+callees and plans one shared route for all callsites that have the same
+effective target.
