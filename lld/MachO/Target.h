@@ -12,7 +12,9 @@
 #include "MachOStructs.h"
 #include "Relocations.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/BitmaskEnum.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/BinaryFormat/MachO.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -30,6 +32,9 @@ class Defined;
 class DylibSymbol;
 class InputSection;
 class ObjFile;
+
+// Branch range extension kind used for long jump in finalization.
+using ExtenderKind = uint8_t;
 
 static_assert(static_cast<uint32_t>(UNWIND_X86_64_MODE_MASK) ==
                   static_cast<uint32_t>(UNWIND_X86_MODE_MASK) &&
@@ -99,13 +104,25 @@ public:
 
   virtual uint64_t getPageSize() const = 0;
 
-  virtual void populateThunk(InputSection *thunk, Symbol *funcSym,
-                             int64_t addend) {
-    llvm_unreachable("target does not use thunks");
+  virtual bool usesExtenders() const { return false; }
+  virtual ExtenderKind getChainExtenderKind() const {
+    llvm_unreachable("target does not use branch range extenders");
   }
-
-  virtual void populateIsland(InputSection *island, Symbol *funcSym) {
-    llvm_unreachable("target does not use branch islands");
+  virtual ExtenderKind getFallbackExtenderKind() const {
+    llvm_unreachable("target does not use branch range extenders");
+  }
+  virtual size_t getExtenderSize(ExtenderKind kind) const {
+    llvm_unreachable("target does not use branch range extenders");
+  }
+  virtual uint32_t getExtenderAlign(ExtenderKind kind) const {
+    llvm_unreachable("target does not use branch range extenders");
+  }
+  virtual llvm::StringRef getExtenderSuffix(ExtenderKind kind) const {
+    llvm_unreachable("target does not use branch range extenders");
+  }
+  virtual void populateExtender(InputSection *isec, ExtenderKind kind,
+                                Symbol *funcSym, int64_t addend) const {
+    llvm_unreachable("target does not use branch range extenders");
   }
 
   const RelocAttrs &getRelocAttrs(uint8_t type) const {
@@ -118,9 +135,6 @@ public:
   bool hasAttr(uint8_t type, RelocAttrBits bit) const {
     return getRelocAttrs(type).hasAttr(bit);
   }
-
-  bool usesThunks() const { return thunkSize > 0; }
-  bool usesIslands() const { return islandSize > 0; }
 
   // For now, handleDtraceReloc only implements -no_dtrace_dof, and ensures
   // that the linking would not fail even when there are user-provided dtrace
@@ -146,8 +160,6 @@ public:
   uint8_t p2WordSize;
   size_t wordSize;
 
-  size_t thunkSize = 0;
-  size_t islandSize = 0;
   uint64_t forwardBranchRange = 0;
   uint64_t backwardBranchRange = 0;
 

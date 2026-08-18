@@ -33,15 +33,23 @@ struct ARM64 : ARM64Common {
   void writeObjCMsgSendStub(uint8_t *buf, Symbol *sym, uint64_t stubsAddr,
                             uint64_t &stubOffset, uint64_t selrefVA,
                             Symbol *objcMsgSend) const override;
-  void populateThunk(InputSection *thunk, Symbol *funcSym,
-                     int64_t addend) override;
-  void populateIsland(InputSection *island, Symbol *funcSym) override;
+  bool usesExtenders() const override { return true; }
+  ExtenderKind getChainExtenderKind() const override;
+  ExtenderKind getFallbackExtenderKind() const override;
+  size_t getExtenderSize(ExtenderKind kind) const override;
+  uint32_t getExtenderAlign(ExtenderKind kind) const override;
+  StringRef getExtenderSuffix(ExtenderKind kind) const override;
+  void populateExtender(InputSection *isec, ExtenderKind kind, Symbol *funcSym,
+                        int64_t addend) const override;
 
   void initICFSafeThunkBody(InputSection *thunk,
                             Symbol *targetSym) const override;
   Symbol *getThunkBranchTarget(InputSection *thunk) const override;
   uint32_t getICFSafeThunkSize() const override;
 };
+
+static constexpr ExtenderKind branchIsland = 0;
+static constexpr ExtenderKind absoluteThunk = 1;
 
 } // namespace
 
@@ -162,8 +170,7 @@ static constexpr uint32_t thunkCode[] = {
     0xd61f0200, // 08: br    x16
 };
 
-void ARM64::populateThunk(InputSection *thunk, Symbol *funcSym,
-                          int64_t addend) {
+static void populateThunk(InputSection *thunk, Symbol *funcSym, int64_t addend) {
   thunk->align = 4;
   thunk->data = {reinterpret_cast<const uint8_t *>(thunkCode),
                  sizeof(thunkCode)};
@@ -182,15 +189,67 @@ static constexpr uint32_t islandCode[] = {
     0x14000000, // b <target>
 };
 
-void ARM64::populateIsland(InputSection *island, Symbol *funcSym) {
+static void populateIsland(InputSection *island, Symbol *funcSym,
+                           int64_t addend) {
   island->align = 4;
   island->data = {reinterpret_cast<const uint8_t *>(islandCode),
                   sizeof(islandCode)};
   island->relocs.emplace_back(/*type=*/ARM64_RELOC_BRANCH26,
                               /*pcrel=*/true, /*length=*/2,
-                              /*offset=*/0, /*addend=*/0,
+                              /*offset=*/0, /*addend=*/addend,
                               /*referent=*/funcSym);
 }
+
+ExtenderKind ARM64::getChainExtenderKind() const { return branchIsland; }
+
+ExtenderKind ARM64::getFallbackExtenderKind() const { return absoluteThunk; }
+
+size_t ARM64::getExtenderSize(ExtenderKind kind) const {
+  switch (kind) {
+  case branchIsland:
+    return sizeof(islandCode);
+  case absoluteThunk:
+    return sizeof(thunkCode);
+  default:
+    llvm_unreachable("unknown ARM64 branch range extender kind");
+  }
+}
+
+uint32_t ARM64::getExtenderAlign(ExtenderKind kind) const {
+  switch (kind) {
+  case branchIsland:
+  case absoluteThunk:
+    return 4;
+  default:
+    llvm_unreachable("unknown ARM64 branch range extender kind");
+  }
+}
+
+StringRef ARM64::getExtenderSuffix(ExtenderKind kind) const {
+  switch (kind) {
+  case branchIsland:
+    return ".island.";
+  case absoluteThunk:
+    return ".thunk.";
+  default:
+    llvm_unreachable("unknown ARM64 branch range extender kind");
+  }
+}
+
+void ARM64::populateExtender(InputSection *isec, ExtenderKind kind,
+                             Symbol *funcSym, int64_t addend) const {
+  switch (kind) {
+  case branchIsland:
+    populateIsland(isec, funcSym, addend);
+    return;
+  case absoluteThunk:
+    populateThunk(isec, funcSym, addend);
+    return;
+  default:
+    llvm_unreachable("unknown ARM64 branch range extender kind");
+  }
+}
+
 // Just a single direct branch to the target function.
 static constexpr uint32_t icfSafeThunkCode[] = {
     0x14000000, // 08: b    target
@@ -225,8 +284,6 @@ ARM64::ARM64() : ARM64Common(LP64()) {
   cpuSubtype = CPU_SUBTYPE_ARM64_ALL;
 
   stubSize = sizeof(stubCode);
-  thunkSize = sizeof(thunkCode);
-  islandSize = sizeof(islandCode);
 
   objcStubsFastSize = sizeof(objcStubsFastCode);
   objcStubsFastAlignment = 32;

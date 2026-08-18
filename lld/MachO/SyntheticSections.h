@@ -286,7 +286,7 @@ public:
   // LazyPointerSection.
   void addEntry(Symbol *);
   uint64_t getVA(uint32_t stubsIndex) const {
-    assert(isFinal || target->usesThunks());
+    assert(isFinal || target->usesExtenders());
     // ConcatOutputSection::finalize() can seek the address of a
     // stub before its address is assigned. Before __stubs is
     // finalized, return a contrived out-of-range address.
