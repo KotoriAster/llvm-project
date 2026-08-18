@@ -155,19 +155,18 @@ struct Callee {
 };
 
 struct Extender {
-  Extender(Callee &callee, uint32_t boundaryIdx, bool isThunk, uint64_t va)
-      : callee(&callee), boundaryIdx(boundaryIdx), isThunk(isThunk), va(va) {}
+  Extender(Callee &callee, uint32_t boundaryIdx, ExtenderKind kind, uint64_t va)
+      : callee(&callee), boundaryIdx(boundaryIdx), kind(kind), va(va) {}
 
-  size_t size() const {
-    return isThunk ? target->thunkSize : target->islandSize;
-  }
+  size_t size() const { return target->getExtenderSize(kind); }
+  uint32_t align() const { return target->getExtenderAlign(kind); }
 
   // The ultimate destination is needed to materialize the extender body.
   Callee *callee;
 
   // The insertion boundary connects the proposal to its owning text section.
   uint32_t boundaryIdx;
-  bool isThunk;
+  ExtenderKind kind;
 
   // Only candidates referenced by a call or island chain are materialized.
   bool live = false;
@@ -219,7 +218,9 @@ namespace lld::macho {
 class TextOutputSection::Finalizer {
 public:
   explicit Finalizer(TextOutputSection &first)
-      : first(first), maxHops(config->branchRangeExtensionMaxHops) {
+      : first(first), maxHops(config->branchRangeExtensionMaxHops),
+        chainKind(target->getChainExtenderKind()),
+        fallbackKind(target->getFallbackExtenderKind()) {
     collect();
   }
   void run();
@@ -231,6 +232,10 @@ private:
 
   // Maximum number of island hops before falling back to a thunk.
   const uint32_t maxHops;
+
+  // Extender roles are target-defined; the planner only owns the fallback rule.
+  const ExtenderKind chainKind;
+  const ExtenderKind fallbackKind;
 
   // Boundaries hold the insertion points and per-pass layout state.
   SmallVector<Boundary, 0> boundaries;
@@ -274,9 +279,10 @@ private:
   // Keep representative insertion points about one 1 MiB apart. This prevents
   // island chains from concentrating at the edge of their branch window.
   void initializePlacementBoundaries();
-  std::optional<uint32_t> findIslandBoundary(uint64_t, uint64_t) const;
-  Extender *insertExtender(Callee &, uint32_t, bool);
-  Extender *placeThunk(SmallVectorImpl<Extender *> &, Callee &, uint64_t);
+  std::optional<uint32_t> findChainBoundary(uint64_t, uint64_t) const;
+  Extender *insertExtender(Callee &, uint32_t, ExtenderKind);
+  Extender *placeFallbackExtender(SmallVectorImpl<Extender *> &, Callee &,
+                                  uint64_t);
   void planSide(Callee &, MutableArrayRef<Callsite>,
                 SmallVectorImpl<Extender *> &);
   void planCallee(Callee &);
@@ -436,7 +442,7 @@ void TextOutputSection::Finalizer::walkLayout(LayoutKind kind) {
         while (extenderIdx < extenders.size() &&
                extenders[extenderIdx]->boundaryIdx == boundaryIdx) {
           Extender &extender = *extenders[extenderIdx++];
-          extender.va = allocate(extender.size(), 4);
+          extender.va = allocate(extender.size(), extender.align());
           finalizeAt(extender.isec, extender.va);
           if (finalizing)
             owner->thunks.push_back(extender.isec);
@@ -521,8 +527,8 @@ void TextOutputSection::Finalizer::initializePlacementBoundaries() {
 }
 
 std::optional<uint32_t>
-TextOutputSection::Finalizer::findIslandBoundary(uint64_t callVA,
-                                                 uint64_t anchorVA) const {
+TextOutputSection::Finalizer::findChainBoundary(uint64_t callVA,
+                                                uint64_t anchorVA) const {
   if (callVA == anchorVA)
     return std::nullopt;
   bool upper = callVA > anchorVA;
@@ -541,26 +547,26 @@ TextOutputSection::Finalizer::findIslandBoundary(uint64_t callVA,
 
 Extender *TextOutputSection::Finalizer::insertExtender(Callee &callee,
                                                        uint32_t boundaryIdx,
-                                                       bool isThunk) {
+                                                       ExtenderKind kind) {
   Boundary &boundary = boundaries[boundaryIdx];
   Extender *extender =
-      make<Extender>(callee, boundaryIdx, isThunk, boundary.getExtenderVA());
+      make<Extender>(callee, boundaryIdx, kind, boundary.getExtenderVA());
   boundary.planned += extender->size();
   extenders.push_back(extender);
   return extender;
 }
 
 Extender *
-TextOutputSection::Finalizer::placeThunk(SmallVectorImpl<Extender *> &thunks,
-                                         Callee &callee, uint64_t callVA) {
-  if (auto it = llvm::find_if(thunks,
-                              [callVA](const Extender *thunk) {
-                                return inBranchRange(callVA, thunk->va);
+TextOutputSection::Finalizer::placeFallbackExtender(
+    SmallVectorImpl<Extender *> &fallbacks, Callee &callee, uint64_t callVA) {
+  if (auto it = llvm::find_if(fallbacks,
+                              [callVA](const Extender *fallback) {
+                                return inBranchRange(callVA, fallback->va);
                               });
-      it != thunks.end())
-    return *it; // reuse an existing in-range thunk
+      it != fallbacks.end())
+    return *it; // reuse an existing in-range fallback extender
 
-  // Place the thunk at the inward edge of the callsite's branch window. This
+  // Place the fallback at the inward edge of the callsite's branch window. This
   // maximizes the range that later, nearer callsites can share.
   uint64_t low = subSat(callVA, target->backwardBranchRange);
   uint64_t high = addSat(callVA, target->forwardBranchRange);
@@ -570,16 +576,17 @@ TextOutputSection::Finalizer::placeThunk(SmallVectorImpl<Extender *> &thunks,
       low, high,
       upper ? BoundaryPreference::lowest : BoundaryPreference::highest);
   if (!boundaryIdx)
-    fatal("cannot place branch thunk for " + toString(*callee.target()));
-  Extender *thunk = insertExtender(callee, *boundaryIdx, true);
-  thunks.push_back(thunk);
-  return thunk;
+    fatal("cannot place branch fallback extender for " +
+          toString(*callee.target()));
+  Extender *fallback = insertExtender(callee, *boundaryIdx, fallbackKind);
+  fallbacks.push_back(fallback);
+  return fallback;
 }
 
 // Plan the callsites on one side of the callee, from the furthest inward.
 void TextOutputSection::Finalizer::planSide(
     Callee &callee, MutableArrayRef<Callsite> side,
-    SmallVectorImpl<Extender *> &thunks) {
+    SmallVectorImpl<Extender *> &fallbacks) {
   if (side.empty())
     return;
   uint64_t targetVA = *callee.getVA();
@@ -598,20 +605,20 @@ void TextOutputSection::Finalizer::planSide(
     furthest = &*it;
   }
 
-  SmallVector<Extender *, 4> islands;
+  SmallVector<Extender *, 4> chain;
   uint64_t callVA = furthest->getVA();
   uint64_t anchorVA = targetVA;
   bool forceExtender = furthest->forceExtender;
-  // Drive island spine growth until island `anchorVA` is reachable for maxHops is reached.
+  // Drive chain growth until `anchorVA` is reachable or maxHops is reached.
   for (uint32_t depth = 0;
        depth < maxHops && (forceExtender || !inBranchRange(callVA, anchorVA));
        ++depth) {
-    auto boundaryIdx = findIslandBoundary(callVA, anchorVA);
+    auto boundaryIdx = findChainBoundary(callVA, anchorVA);
     if (!boundaryIdx)
       break;
-    Extender *island = insertExtender(callee, *boundaryIdx, false);
-    islands.push_back(island);
-    anchorVA = island->va;
+    Extender *extender = insertExtender(callee, *boundaryIdx, chainKind);
+    chain.push_back(extender);
+    anchorVA = extender->va;
     forceExtender = false;
   }
   for (auto &callsite : llvm::reverse_conditionally(side, upper)) {
@@ -619,23 +626,23 @@ void TextOutputSection::Finalizer::planSide(
     if (!callsite.forceExtender && inBranchRange(callVA, targetVA))
       continue;
     uint64_t bestDistance = UINT64_MAX;
-    for (auto *island : islands) {
+    for (auto *extender : chain) {
       uint64_t distance =
-          callVA > island->va ? callVA - island->va : island->va - callVA;
-      if (distance < bestDistance && inBranchRange(callVA, island->va)) {
-        callsite.extender = island;
+          callVA > extender->va ? callVA - extender->va : extender->va - callVA;
+      if (distance < bestDistance && inBranchRange(callVA, extender->va)) {
+        callsite.extender = extender;
         bestDistance = distance;
       }
     }
-    if (!callsite.extender) // no island is usable.
-      callsite.extender = placeThunk(thunks, callee, callVA);
-    if (!callsite.extender) // Failed to create a thunk extender.
+    if (!callsite.extender) // no chain extender is usable.
+      callsite.extender = placeFallbackExtender(fallbacks, callee, callVA);
+    if (!callsite.extender) // Failed to create a fallback extender.
       fatal("cannot route branch to " + toString(*callee.target()));
     callsite.extender->live = true;
-    if (!callsite.extender->isThunk) // Inherit liveness of an island
-      for (auto *island : islands) {
-        island->live = true;
-        if (island == callsite.extender)
+    if (callsite.extender->kind == chainKind) // Inherit liveness of the chain.
+      for (auto *extender : chain) {
+        extender->live = true;
+        if (extender == callsite.extender)
           break;
       }
   }
@@ -646,9 +653,10 @@ void TextOutputSection::Finalizer::planCallee(Callee &callee) {
   if (!target) {
     if (callee.isDtrace())
       return;
-    SmallVector<Extender *, 4> thunks;
+    SmallVector<Extender *, 4> fallbacks;
     for (auto &callsite : callee.callsites) {
-      callsite.extender = placeThunk(thunks, callee, callsite.getVA());
+      callsite.extender =
+          placeFallbackExtender(fallbacks, callee, callsite.getVA());
       if (callsite.extender)
         callsite.extender->live = true;
     }
@@ -661,9 +669,9 @@ void TextOutputSection::Finalizer::planCallee(Callee &callee) {
                                  });
   MutableArrayRef<Callsite> calls(callee.callsites);
   size_t splitIdx = split - callee.callsites.begin();
-  SmallVector<Extender *, 4> thunks;
-  planSide(callee, calls.take_front(splitIdx), thunks);
-  planSide(callee, calls.drop_front(splitIdx), thunks);
+  SmallVector<Extender *, 4> fallbacks;
+  planSide(callee, calls.take_front(splitIdx), fallbacks);
+  planSide(callee, calls.drop_front(splitIdx), fallbacks);
 }
 
 void TextOutputSection::Finalizer::plan() {
@@ -694,7 +702,7 @@ bool TextOutputSection::Finalizer::forEachIslandEdge(Visitor visitor) {
   DenseMap<Callee *, Extender *> inward;
   // Derive an island's next inward hop on the selected target side.
   auto visit = [&](Extender &extender, bool upper) {
-    if (extender.isThunk)
+    if (extender.kind != chainKind)
       return;
     auto target = extender.callee->getVA();
     uint64_t islandVA = extender.va;
@@ -752,7 +760,7 @@ void TextOutputSection::Finalizer::materialize() {
     extender.isec =
         makeSyntheticInputSection(boundary->getSegName(), boundary->getName());
     extender.isec->parent = boundary->parent;
-    StringRef kind = extender.isThunk ? ".thunk." : ".island.";
+    StringRef kind = target->getExtenderSuffix(extender.kind);
     std::string addendSuffix;
     if (callee.addend() != 0)
       addendSuffix = (callee.addend() > 0 ? "+" : "") +
@@ -779,19 +787,20 @@ void TextOutputSection::Finalizer::materialize() {
   forEachIslandEdge([&](Extender &extender, Extender *inward) {
     Callee &callee = *extender.callee;
     create(extender, sequences[&callee].first++);
-    target->populateIsland(extender.isec,
-                           inward ? inward->sym : callee.target());
-    extender.isec->relocs[0].addend = inward ? 0 : callee.addend();
+    target->populateExtender(extender.isec, extender.kind,
+                             inward ? inward->sym : callee.target(),
+                             inward ? 0 : callee.addend());
     return true;
   });
   for (auto *extender : extenders)
-    if (extender->isThunk) {
+    if (extender->kind == fallbackKind) {
       Callee &callee = *extender->callee;
       create(*extender, sequences[&callee].second++);
       if (needsBinding(callee.target()))
         assert(callee.target()->isInStubs() &&
                "stub should have been inserted before finalization");
-      target->populateThunk(extender->isec, callee.target(), callee.addend());
+      target->populateExtender(extender->isec, extender->kind, callee.target(),
+                               callee.addend());
     }
   // Direct callsite to its extender
   for (auto *callee : callees)
@@ -849,7 +858,7 @@ void TextOutputSection::Finalizer::run() {
 void TextOutputSection::finalize() {
   if (branchRangeExtensionFinalized)
     return;
-  if (target->usesThunks() &&
+  if (target->usesExtenders() &&
       sections::isCodeSection(name, parent->name, flags)) {
     Finalizer finalizer(*this);
     finalizer.run();
