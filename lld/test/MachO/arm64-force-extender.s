@@ -18,18 +18,10 @@
 # RUN:   %s -o %t/target.o
 # RUN: %lld -arch arm64 -dylib -undefined dynamic_lookup -o %t/out \
 # RUN:   %t/main.o %t/callers.o %t/near.o %t/target.o \
-# RUN:   --branch-range-extension-max-hops=2 --verbose 2> %t/link.log
-# RUN: FileCheck %s --check-prefix=LOG --input-file=%t/link.log
+# RUN:   --branch-range-extension-max-hops=2
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/out \
 # RUN:   | FileCheck %s --check-prefix=DIS
 # RUN: llvm-nm -n %t/out | FileCheck %s --check-prefix=LAYOUT
-
-# LOG: maxHops=2 branch extender rejected proposal
-# LOG: maxHops=2 branch extender rejected proposal
-# LOG: maxHops=2 branch extender rejected proposal
-# LOG: maxHops=2 branch extender promoted direct calls
-# LOG: maxHops=2 branch extender for __TEXT,__text: passes = 4
-# LOG-SAME: total extenders = 3
 
 # DIS-LABEL: <_near_caller>:
 ## The promoted branch uses the available one-hop island

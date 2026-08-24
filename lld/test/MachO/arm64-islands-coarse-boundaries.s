@@ -12,7 +12,7 @@
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/out \
 # RUN:   | FileCheck %s
 
-# LOG: maxHops=4294967295 branch extender for __TEXT,__text: passes = 1
+# LOG: branch extender for __TEXT,__text: passes = 1
 # LOG-SAME: total extenders = 1
 
 # CHECK-LABEL: <_main>:

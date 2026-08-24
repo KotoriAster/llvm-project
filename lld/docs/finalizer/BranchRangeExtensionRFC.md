@@ -58,7 +58,7 @@ Two island hops cover all call distances in App1, so `maxHops=2` and
 `maxHops=inf` produce the same layout. App2 contains calls that require more
 than two island hops; with `maxHops=2`, those calls use thunks instead.
 
-### Liking performance
+### Linking performance
 
 ![alt text](image.png)
 
