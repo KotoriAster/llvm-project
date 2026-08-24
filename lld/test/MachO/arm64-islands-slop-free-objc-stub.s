@@ -11,7 +11,7 @@
 # RUN: FileCheck %s --check-prefix=LOG --input-file=%t/link.log
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/out | FileCheck %s
 
-# LOG: maxHops=4294967295 branch extender for __TEXT,__text:
+# LOG: branch extender for __TEXT,__text:
 # LOG-SAME: total extenders = 2
 
 # CHECK: <_main>:

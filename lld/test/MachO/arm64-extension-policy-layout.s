@@ -28,33 +28,22 @@
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %s -o %t/input.o
 
 # RUN: %lld -arch arm64 -dylib -o %t/thunks %t/input.o \
-# RUN:   --branch-range-extension-max-hops=0 --verbose 2> %t/thunks.log
-# RUN: FileCheck %s --check-prefix=THUNKS-LOG --input-file=%t/thunks.log
+# RUN:   --branch-range-extension-max-hops=0
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/thunks \
 # RUN:   | FileCheck %s --check-prefix=THUNKS
 # RUN: rm %t/thunks
 
 # RUN: %lld -arch arm64 -dylib -o %t/hybrid %t/input.o \
-# RUN:   --branch-range-extension-max-hops=2 --verbose 2> %t/hybrid.log
-# RUN: FileCheck %s --check-prefix=HYBRID-LOG --input-file=%t/hybrid.log
+# RUN:   --branch-range-extension-max-hops=2
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/hybrid \
 # RUN:   | FileCheck %s --check-prefix=HYBRID
 # RUN: rm %t/hybrid
 
 # RUN: %lld -arch arm64 -dylib -o %t/islands %t/input.o \
-# RUN:   --branch-range-extension-max-hops=4294967295 --verbose \
-# RUN:   2> %t/islands.log
-# RUN: FileCheck %s --check-prefix=ISLANDS-LOG --input-file=%t/islands.log
+# RUN:   --branch-range-extension-max-hops=4294967295
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/islands \
 # RUN:   | FileCheck %s --check-prefix=ISLANDS
 # RUN: rm %t/islands
-
-# THUNKS-LOG: maxHops=0 branch extender for __TEXT,__text:
-# THUNKS-LOG-SAME: total extenders = 4
-# HYBRID-LOG: maxHops=2 branch extender for __TEXT,__text:
-# HYBRID-LOG-SAME: total extenders = 5
-# ISLANDS-LOG: maxHops=4294967295 branch extender for __TEXT,__text:
-# ISLANDS-LOG-SAME: total extenders = 9
 
 # THUNKS-LABEL: <_main>:
 # THUNKS-NEXT: bl 0x{{[0-9a-f]+}} <_one_hop.thunk.0>

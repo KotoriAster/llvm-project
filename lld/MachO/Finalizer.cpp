@@ -55,7 +55,8 @@ static std::optional<uint32_t> findInDirection(Range &&range, bool ascending,
 }
 
 /* Boundaries are insertion points between isecs :
-current isec (i)    planned extenders         alignment padding    next isec (i+1)
+current isec (i)    planned extenders         alignment padding    next isec
+(i+1)
 |-------------------|-----boundary (i)--------|....................|
 inputVA             getVA()                   getExtenderVA()      next inputVA
 */
@@ -63,15 +64,15 @@ struct Boundary {
   uint64_t getVA() const {
     return alignToPowerOf2(inputVA + isec->getSize(), 4);
   }
-  uint64_t getExtenderVA() const { return getVA() + planned; }
+  uint64_t getExtenderVA() const { return getVA() + plannedSize; }
 
   ConcatInputSection *isec;
 
   // Extender contribution retained from rejected proposals for convergence.
-  uint32_t reserved = 0;
+  uint32_t reservedSize = 0;
 
   // Total size of extenders placed at this boundary.
-  uint32_t planned = 0;
+  uint32_t plannedSize = 0;
 
   // The current layout's input address anchors callers and insertion points.
   uint64_t inputVA = 0;
@@ -100,10 +101,10 @@ struct Callsite {
 };
 
 struct Callee {
-  using EstimateSectionVA =
+  using EstimateOutputSectionVA =
       function_ref<std::optional<uint64_t>(OutputSection *)>;
 
-  void resolveVA(EstimateSectionVA estimateSectionVA) {
+  void resolveVA(EstimateOutputSectionVA estimateOutputSectionVA) {
     va.reset();
     Symbol *sym = target();
     int64_t targetAddend = addend();
@@ -111,7 +112,7 @@ struct Callee {
     if (sym->isInStubs() && targetAddend == 0) {
       if (in.stubs->isFinal)
         va = sym->getStubVA();
-      else if (auto sectionVA = estimateSectionVA(in.stubs))
+      else if (auto sectionVA = estimateOutputSectionVA(in.stubs))
         va = *sectionVA +
              uint64_t(sym->stubsIndex) * lld::macho::target->stubSize;
       return;
@@ -123,7 +124,7 @@ struct Callee {
 
     if (in.objcStubs && defined->isec() == in.objcStubs->isec &&
         in.objcStubs->isNeeded()) {
-      if (auto sectionVA = estimateSectionVA(in.objcStubs))
+      if (auto sectionVA = estimateOutputSectionVA(in.objcStubs))
         va = *sectionVA + defined->value + targetAddend;
       return;
     }
@@ -138,7 +139,7 @@ struct Callee {
 
   std::optional<uint64_t> getVA() const { return va; }
   bool promoteCallsites();
-  void redirectCallsites();
+  void redirectCallsitesToBranchExtensionExtenders();
 
   SmallVector<Callsite, 1> callsites;
   Symbol *target() const {
@@ -156,13 +157,13 @@ struct Callee {
 
 struct Extender {
   Extender(Callee &callee, uint32_t boundaryIdx, ExtenderKind kind, uint64_t va)
-      : callee(&callee), boundaryIdx(boundaryIdx), kind(kind), va(va) {}
+      : callee(callee), boundaryIdx(boundaryIdx), kind(kind), va(va) {}
 
   size_t size() const { return target->getExtenderSize(kind); }
   uint32_t align() const { return target->getExtenderAlign(kind); }
 
   // The ultimate destination is needed to materialize the extender body.
-  Callee *callee;
+  Callee & callee;
 
   // The insertion boundary connects the proposal to its owning text section.
   uint32_t boundaryIdx;
@@ -195,7 +196,7 @@ bool Callee::promoteCallsites() {
   return promoted;
 }
 
-void Callee::redirectCallsites() {
+void Callee::redirectCallsitesToBranchExtensionExtenders() {
   std::optional<uint64_t> directTarget = getVA();
   for (auto &callsite : callsites)
     if (callsite.extender &&
@@ -240,8 +241,8 @@ private:
   // Boundaries hold the insertion points and per-pass layout state.
   SmallVector<Boundary, 0> boundaries;
 
-  // Owners are the consecutive text output sections laid out as one group.
-  SmallVector<TextOutputSection *, 4> owners;
+  // Consecutive text output sections laid out together.
+  SmallVector<TextOutputSection *, 4> textOutputSections;
 
   // Callees group branches that can share extender chains.
   SmallVector<Callee *, 0> callees;
@@ -251,23 +252,22 @@ private:
 
   // Sparse placement candidates spread islands through large inputs without
   // considering every boundary for every hop.
-  SmallVector<uint32_t, 0> placementBoundaries;
+  SmallVector<uint32_t, 0> islandPlacementBoundaryIndexes;
 
   // Cache post-text section address estimates during a proposed layout.
   DenseMap<OutputSection *, uint64_t> estimatedPostTextSectionVAs;
 
-  // Later output-section estimates begin at the end of the code group.
+  // Later output-section estimates begin after the finalized text sections.
   uint64_t textEndVA = 0;
 
   // Until exact layout rejects a direct call, forced-callsite scans are empty.
-  bool hasForcedCallsites = false;
-  std::string name() const { return "maxHops=" + std::to_string(maxHops); }
+  bool hasCallsitesRequiringExtenders = false;
   void collect();
   std::optional<uint64_t> estimatePostTextSectionVA(OutputSection *);
   enum class LayoutKind {
-    reservation, // Use padding retained from rejected proposals.
-    proposal,    // Insert the active proposal without mutating sections.
-    finalizable, // Finalize sections with the accepted proposal.
+    reservation,  // Use padding retained from rejected proposals.
+    proposal,     // Insert the active proposal without mutating sections.
+    finalization, // Finalize sections with the accepted proposal.
   };
   void walkLayout(LayoutKind);
   // Return the first boundary at `va` or later, or strictly later than `va`.
@@ -278,22 +278,22 @@ private:
                                        BoundaryPreference) const;
   // Keep representative insertion points about one 1 MiB apart. This prevents
   // island chains from concentrating at the edge of their branch window.
-  void initializePlacementBoundaries();
+  void initializeIslandPlacementBoundaryIndexes();
   std::optional<uint32_t> findChainBoundary(uint64_t, uint64_t) const;
-  Extender *insertExtender(Callee &, uint32_t, ExtenderKind);
+  Extender *planBranchExtensionExtender(Callee &, uint32_t, ExtenderKind);
   Extender *placeFallbackExtender(SmallVectorImpl<Extender *> &, Callee &,
                                   uint64_t);
-  void planSide(Callee &, MutableArrayRef<Callsite>,
-                SmallVectorImpl<Extender *> &);
-  void planCallee(Callee &);
-  void plan();
-  bool update();
+  void planBranchExtensionsForCallsiteSide(Callee &, MutableArrayRef<Callsite>,
+                                           SmallVectorImpl<Extender *> &);
+  void planBranchExtensionsForCallee(Callee &);
+  void planBranchExtension();
+  bool recoverFromRejectedProposal();
   // Extenders are boundary-ordered. Walking each side from the target outward
   // makes the previously visited island the current island's next branch hop,
   // so the extender need not store a redundant extender-to-extender edge.
-  template <typename Visitor> bool forEachIslandEdge(Visitor);
-  bool validate();
-  void materialize();
+  template <typename Visitor> bool forEachIslandEdge(Visitor) const;
+  bool isLayoutValid() const;
+  void finalizeBranchExtensionPlan();
 };
 
 void TextOutputSection::Finalizer::collect() {
@@ -304,7 +304,7 @@ void TextOutputSection::Finalizer::collect() {
     if (!text ||
         !sections::isCodeSection(text->name, first.parent->name, text->flags))
       break;
-    owners.push_back(text);
+    textOutputSections.push_back(text);
     for (auto *isec : text->inputs)
       boundaries.push_back({isec});
   }
@@ -367,10 +367,12 @@ std::optional<uint64_t> TextOutputSection::Finalizer::estimatePostTextSectionVA(
   const auto &sections = first.parent->getSections();
 
   uint64_t va = textEndVA;
-  auto lastOwnerIt = llvm::find(sections, owners.back());
-  assert(lastOwnerIt != sections.end());
+  auto lastTextOutputSectionIt =
+      llvm::find(sections, textOutputSections.back());
+  assert(lastTextOutputSectionIt != sections.end());
   // Walk post-text sections to estimate the target's aligned VA.
-  for (auto *osec : llvm::make_range(std::next(lastOwnerIt), sections.end())) {
+  for (auto *osec :
+       llvm::make_range(std::next(lastTextOutputSectionIt), sections.end())) {
     if (!osec->isNeeded())
       continue;
 
@@ -394,21 +396,23 @@ std::optional<uint64_t> TextOutputSection::Finalizer::estimatePostTextSectionVA(
 }
 
 void TextOutputSection::Finalizer::walkLayout(LayoutKind kind) {
-  const bool finalizing = kind == LayoutKind::finalizable;
-  const uint64_t groupVA = first.addr;
-  uint64_t groupSize = 0;
+  const bool finalizing = kind == LayoutKind::finalization;
+  const uint64_t textOutputSectionsStartVA = first.addr;
+  uint64_t textOutputSectionsSize = 0;
   uint32_t boundaryIdx = 0;
   // Extenders are boundary-ordered, so this cursor visits each exactly once.
   size_t extenderIdx = 0;
 
-  for (auto *owner : owners) {
-    groupSize = alignToPowerOf2(groupSize, owner->align);
-    const uint64_t sectionVA = groupVA + groupSize;
+  for (auto *textOutputSection : textOutputSections) {
+    textOutputSectionsSize =
+        alignToPowerOf2(textOutputSectionsSize, textOutputSection->align);
+    const uint64_t sectionVA =
+        textOutputSectionsStartVA + textOutputSectionsSize;
     uint64_t sectionSize = 0;
 
     if (finalizing) {
-      owner->addr = sectionVA;
-      owner->size = owner->fileSize = 0;
+      textOutputSection->addr = sectionVA;
+      textOutputSection->size = textOutputSection->fileSize = 0;
     }
 
     // Allocate one aligned contribution within the current output section.
@@ -422,44 +426,45 @@ void TextOutputSection::Finalizer::walkLayout(LayoutKind kind) {
     auto finalizeAt = [&](ConcatInputSection *isec, uint64_t expectedVA) {
       if (!finalizing)
         return;
-      owner->finalizeOne(isec);
+      textOutputSection->finalizeOne(isec);
       assert(isec->getVA() == expectedVA);
     };
 
-    for (auto *isec : owner->inputs) {
+    for (auto *isec : textOutputSection->inputs) {
       Boundary &boundary = boundaries[boundaryIdx];
       boundary.inputVA = allocate(isec->getSize(), isec->align);
       finalizeAt(isec, boundary.inputVA);
 
       switch (kind) {
-      case LayoutKind::reservation: 
-        if (boundary.reserved) // Grow `sectionSize` so reservation shift next isec.
-          allocate(boundary.reserved, 4);
+      case LayoutKind::reservation:
+        // Grow `sectionSize` so the reservation shifts the next isec.
+        if (boundary.reservedSize)
+          allocate(boundary.reservedSize, 4);
         break;
       case LayoutKind::proposal:
         [[fallthrough]];
-      case LayoutKind::finalizable:
+      case LayoutKind::finalization:
         while (extenderIdx < extenders.size() &&
                extenders[extenderIdx]->boundaryIdx == boundaryIdx) {
           Extender &extender = *extenders[extenderIdx++];
           extender.va = allocate(extender.size(), extender.align());
           finalizeAt(extender.isec, extender.va);
           if (finalizing)
-            owner->thunks.push_back(extender.isec);
+            textOutputSection->thunks.push_back(extender.isec);
         }
         break;
       }
       ++boundaryIdx;
     }
 
-    groupSize += sectionSize;
+    textOutputSectionsSize += sectionSize;
     if (finalizing)
-      owner->branchRangeExtensionFinalized = true;
+      textOutputSection->branchRangeExtensionFinalized = true;
   }
 
   assert(boundaryIdx == boundaries.size());
   assert(kind == LayoutKind::reservation || extenderIdx == extenders.size());
-  textEndVA = groupVA + groupSize;
+  textEndVA = textOutputSectionsStartVA + textOutputSectionsSize;
   estimatedPostTextSectionVAs.clear();
   if (!finalizing)
     for (auto *callee : callees)
@@ -493,10 +498,10 @@ std::optional<uint32_t> TextOutputSection::Finalizer::findBoundary(
   };
 
   auto coarseBegin = llvm::lower_bound(
-      placementBoundaries, lowVA,
+      islandPlacementBoundaryIndexes, lowVA,
       [&](uint32_t idx, uint64_t va) { return boundaries[idx].getVA() < va; });
   auto coarseEnd = llvm::upper_bound(
-      placementBoundaries, highVA,
+      islandPlacementBoundaryIndexes, highVA,
       [&](uint64_t va, uint32_t idx) { return va < boundaries[idx].getVA(); });
   if (auto idx = findInDirection(llvm::make_range(coarseBegin, coarseEnd),
                                  ascending, isUsable))
@@ -507,11 +512,11 @@ std::optional<uint32_t> TextOutputSection::Finalizer::findBoundary(
   return findInDirection(llvm::seq(begin, end), ascending, isUsable);
 }
 
-void TextOutputSection::Finalizer::initializePlacementBoundaries() {
-  if (!placementBoundaries.empty() || boundaries.empty())
+void TextOutputSection::Finalizer::initializeIslandPlacementBoundaryIndexes() {
+  if (!islandPlacementBoundaryIndexes.empty() || boundaries.empty())
     return;
 
-  placementBoundaries.push_back(0);
+  islandPlacementBoundaryIndexes.push_back(0);
   uint64_t lastVA = boundaries.front().getVA();
   for (auto [idx, boundary] : llvm::enumerate(boundaries)) {
     if (idx == 0 || idx + 1 == boundaries.size())
@@ -519,11 +524,11 @@ void TextOutputSection::Finalizer::initializePlacementBoundaries() {
     uint64_t va = boundary.getVA();
     if (va - lastVA < boundarySpacing)
       continue;
-    placementBoundaries.push_back(idx);
+    islandPlacementBoundaryIndexes.push_back(idx);
     lastVA = va;
   }
   if (boundaries.size() > 1)
-    placementBoundaries.push_back(boundaries.size() - 1);
+    islandPlacementBoundaryIndexes.push_back(boundaries.size() - 1);
 }
 
 std::optional<uint32_t>
@@ -545,19 +550,17 @@ TextOutputSection::Finalizer::findChainBoundary(uint64_t callVA,
                             : BoundaryPreference::lowest);
 }
 
-Extender *TextOutputSection::Finalizer::insertExtender(Callee &callee,
-                                                       uint32_t boundaryIdx,
-                                                       ExtenderKind kind) {
+Extender *TextOutputSection::Finalizer::planBranchExtensionExtender(
+    Callee &callee, uint32_t boundaryIdx, ExtenderKind kind) {
   Boundary &boundary = boundaries[boundaryIdx];
   Extender *extender =
       make<Extender>(callee, boundaryIdx, kind, boundary.getExtenderVA());
-  boundary.planned += extender->size();
+  boundary.plannedSize += extender->size();
   extenders.push_back(extender);
   return extender;
 }
 
-Extender *
-TextOutputSection::Finalizer::placeFallbackExtender(
+Extender *TextOutputSection::Finalizer::placeFallbackExtender(
     SmallVectorImpl<Extender *> &fallbacks, Callee &callee, uint64_t callVA) {
   if (auto it = llvm::find_if(fallbacks,
                               [callVA](const Extender *fallback) {
@@ -578,13 +581,14 @@ TextOutputSection::Finalizer::placeFallbackExtender(
   if (!boundaryIdx)
     fatal("cannot place branch fallback extender for " +
           toString(*callee.target()));
-  Extender *fallback = insertExtender(callee, *boundaryIdx, fallbackKind);
+  Extender *fallback =
+      planBranchExtensionExtender(callee, *boundaryIdx, fallbackKind);
   fallbacks.push_back(fallback);
   return fallback;
 }
 
 // Plan the callsites on one side of the callee, from the furthest inward.
-void TextOutputSection::Finalizer::planSide(
+void TextOutputSection::Finalizer::planBranchExtensionsForCallsiteSide(
     Callee &callee, MutableArrayRef<Callsite> side,
     SmallVectorImpl<Extender *> &fallbacks) {
   if (side.empty())
@@ -594,8 +598,9 @@ void TextOutputSection::Finalizer::planSide(
   Callsite *furthest = upper ? &side.back() : &side.front();
 
   if (inBranchRange(furthest->getVA(), targetVA)) {
-    if (!hasForcedCallsites)
-      return; // Furthest is range.
+    if (!hasCallsitesRequiringExtenders)
+      // The furthest callsite is in range.
+      return;
     // Otherwise, the furthest should be the one forcing an extender.
     auto outward = llvm::reverse_conditionally(side, upper);
     auto it = llvm::find_if(outward,
@@ -616,7 +621,8 @@ void TextOutputSection::Finalizer::planSide(
     auto boundaryIdx = findChainBoundary(callVA, anchorVA);
     if (!boundaryIdx)
       break;
-    Extender *extender = insertExtender(callee, *boundaryIdx, chainKind);
+    Extender *extender =
+        planBranchExtensionExtender(callee, *boundaryIdx, chainKind);
     chain.push_back(extender);
     anchorVA = extender->va;
     forceExtender = false;
@@ -648,7 +654,8 @@ void TextOutputSection::Finalizer::planSide(
   }
 }
 
-void TextOutputSection::Finalizer::planCallee(Callee &callee) {
+void TextOutputSection::Finalizer::planBranchExtensionsForCallee(
+    Callee &callee) {
   auto target = callee.getVA();
   if (!target) {
     if (callee.isDtrace())
@@ -670,25 +677,27 @@ void TextOutputSection::Finalizer::planCallee(Callee &callee) {
   MutableArrayRef<Callsite> calls(callee.callsites);
   size_t splitIdx = split - callee.callsites.begin();
   SmallVector<Extender *, 4> fallbacks;
-  planSide(callee, calls.take_front(splitIdx), fallbacks);
-  planSide(callee, calls.drop_front(splitIdx), fallbacks);
+  planBranchExtensionsForCallsiteSide(callee, calls.take_front(splitIdx),
+                                      fallbacks);
+  planBranchExtensionsForCallsiteSide(callee, calls.drop_front(splitIdx),
+                                      fallbacks);
 }
 
-void TextOutputSection::Finalizer::plan() {
+void TextOutputSection::Finalizer::planBranchExtension() {
   extenders.clear();
   for (auto &boundary : boundaries)
-    boundary.planned = 0;
+    boundary.plannedSize = 0;
   for (auto *callee : callees)
     for (auto &callsite : callee->callsites)
       callsite.extender = nullptr;
   walkLayout(LayoutKind::reservation);
-  initializePlacementBoundaries();
+  initializeIslandPlacementBoundaryIndexes();
   for (auto *callee : callees)
-    planCallee(*callee);
+    planBranchExtensionsForCallee(*callee);
   llvm::erase_if(extenders, [&](Extender *extender) {
     if (extender->live)
       return false;
-    boundaries[extender->boundaryIdx].planned -= extender->size();
+    boundaries[extender->boundaryIdx].plannedSize -= extender->size();
     return true;
   });
   llvm::stable_sort(extenders, [](Extender *a, Extender *b) {
@@ -697,14 +706,14 @@ void TextOutputSection::Finalizer::plan() {
 }
 
 template <typename Visitor>
-bool TextOutputSection::Finalizer::forEachIslandEdge(Visitor visitor) {
+bool TextOutputSection::Finalizer::forEachIslandEdge(Visitor visitor) const {
   bool valid = true;
   DenseMap<Callee *, Extender *> inward;
   // Derive an island's next inward hop on the selected target side.
   auto visit = [&](Extender &extender, bool upper) {
     if (extender.kind != chainKind)
       return;
-    auto target = extender.callee->getVA();
+    auto target = extender.callee.getVA();
     uint64_t islandVA = extender.va;
     if (islandVA == *target) {
       valid = false;
@@ -712,7 +721,7 @@ bool TextOutputSection::Finalizer::forEachIslandEdge(Visitor visitor) {
     }
     if ((islandVA > *target) != upper) // check position relativity
       return;
-    Extender *nextInward = std::exchange(inward[extender.callee], &extender);
+    Extender *nextInward = std::exchange(inward[&extender.callee], &extender);
     valid &= visitor(extender, nextInward);
   };
   for (auto *extender : extenders)
@@ -723,10 +732,10 @@ bool TextOutputSection::Finalizer::forEachIslandEdge(Visitor visitor) {
   return valid;
 }
 
-bool TextOutputSection::Finalizer::validate() {
+bool TextOutputSection::Finalizer::isLayoutValid() const {
   // Every island should be in range.
   bool valid = forEachIslandEdge([&](Extender &extender, Extender *inward) {
-    uint64_t targetVA = *extender.callee->getVA();
+    uint64_t targetVA = *extender.callee.getVA();
     return inBranchRange(extender.va, inward ? inward->va : targetVA);
   });
   // Every callsite should be reachable to its extender.
@@ -747,7 +756,7 @@ bool TextOutputSection::Finalizer::validate() {
   return valid;
 }
 
-void TextOutputSection::Finalizer::materialize() {
+void TextOutputSection::Finalizer::finalizeBranchExtensionPlan() {
   assert(
       llvm::all_of(extenders,
                    [](const Extender *extender) { return extender->live; }) &&
@@ -755,7 +764,7 @@ void TextOutputSection::Finalizer::materialize() {
   DenseMap<Callee *, std::pair<size_t, size_t>> sequences;
   // Create the synthetic input section and symbol for one live extender.
   auto create = [&](Extender &extender, size_t sequence) {
-    Callee &callee = *extender.callee;
+    Callee &callee = extender.callee;
     ConcatInputSection *boundary = boundaries[extender.boundaryIdx].isec;
     extender.isec =
         makeSyntheticInputSection(boundary->getSegName(), boundary->getName());
@@ -763,8 +772,8 @@ void TextOutputSection::Finalizer::materialize() {
     StringRef kind = target->getExtenderSuffix(extender.kind);
     std::string addendSuffix;
     if (callee.addend() != 0)
-      addendSuffix = (callee.addend() > 0 ? "+" : "") +
-                     std::to_string(callee.addend());
+      addendSuffix =
+          (callee.addend() > 0 ? "+" : "") + std::to_string(callee.addend());
     StringRef name = saver().save(callee.target()->getName() + addendSuffix +
                                   kind + std::to_string(sequence));
     size_t size = extender.size();
@@ -785,7 +794,7 @@ void TextOutputSection::Finalizer::materialize() {
     extender.sym->used = true;
   };
   forEachIslandEdge([&](Extender &extender, Extender *inward) {
-    Callee &callee = *extender.callee;
+    Callee &callee = extender.callee;
     create(extender, sequences[&callee].first++);
     target->populateExtender(extender.isec, extender.kind,
                              inward ? inward->sym : callee.target(),
@@ -794,7 +803,7 @@ void TextOutputSection::Finalizer::materialize() {
   });
   for (auto *extender : extenders)
     if (extender->kind == fallbackKind) {
-      Callee &callee = *extender->callee;
+      Callee &callee = extender->callee;
       create(*extender, sequences[&callee].second++);
       if (needsBinding(callee.target()))
         assert(callee.target()->isInStubs() &&
@@ -802,17 +811,16 @@ void TextOutputSection::Finalizer::materialize() {
       target->populateExtender(extender->isec, extender->kind, callee.target(),
                                callee.addend());
     }
-  // Direct callsite to its extender
   for (auto *callee : callees)
-    callee->redirectCallsites();
+    callee->redirectCallsitesToBranchExtensionExtenders();
 }
 
-bool TextOutputSection::Finalizer::update() {
+bool TextOutputSection::Finalizer::recoverFromRejectedProposal() {
   bool updated = false;
   for (auto &boundary : boundaries)
     if (uint32_t desired = boundary.getExtenderVA() - boundary.getVA();
-        boundary.reserved < desired) {
-      boundary.reserved = desired;
+        boundary.reservedSize < desired) {
+      boundary.reservedSize = desired;
       updated = true;
     }
   if (updated)
@@ -822,34 +830,31 @@ bool TextOutputSection::Finalizer::update() {
   for (auto *callee : callees)
     promoted |= callee->promoteCallsites();
   if (promoted) {
-    hasForcedCallsites = true;
-    log(name() + " branch extender promoted direct calls");
+    hasCallsitesRequiringExtenders = true;
+    log("branch extender promoted direct calls");
   }
   return promoted;
 }
 
 void TextOutputSection::Finalizer::run() {
-  std::string policyName = name();
-  TimeTraceScope timeScope("Branch extender", policyName);
-  log("finalization mode for " + first.parent->name + "," + first.name + ": " +
-      policyName);
+  TimeTraceScope timeScope("Branch extender");
 
   size_t pass = 1;
   for (; pass <= 30; ++pass) {
-    plan();
+    planBranchExtension();
     walkLayout(LayoutKind::proposal);
-    if (validate())
+    if (isLayoutValid())
       break;
-    log(policyName + " branch extender rejected proposal");
-    if (!update())
+    log("branch extender rejected proposal");
+    if (!recoverFromRejectedProposal())
       pass = 30;
   }
   if (pass > 30)
-    fatal(policyName + " branch extender did not converge");
-  materialize();
-  walkLayout(LayoutKind::finalizable);
-  log(policyName + " branch extender for " + first.parent->name + "," +
-      first.name + ": passes = " + std::to_string(pass) +
+    fatal("branch extender did not converge");
+  finalizeBranchExtensionPlan();
+  walkLayout(LayoutKind::finalization);
+  log("branch extender for " + first.parent->name + "," + first.name +
+      ": passes = " + std::to_string(pass) +
       ", inputs = " + std::to_string(boundaries.size()) +
       ", targets = " + std::to_string(callees.size()) +
       ", total extenders = " + std::to_string(extenders.size()));

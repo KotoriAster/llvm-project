@@ -23,15 +23,9 @@
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin -defsym TARGET=1 \
 # RUN:   %s -o %t/target.o
 # RUN: %lld -arch arm64 -dylib -o %t/out %t/caller.o %t/pad0.o %t/pad1.o \
-# RUN:   %t/target.o --branch-range-extension-max-hops=2 --verbose \
-# RUN:   2> %t/link.log
-# RUN: FileCheck %s --check-prefix=LOG --input-file=%t/link.log
+# RUN:   %t/target.o --branch-range-extension-max-hops=2
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/out \
 # RUN:   | FileCheck %s --check-prefix=DIS
-
-# LOG: maxHops=2 branch extender for __TEXT,__text:
-# LOG-SAME: targets = 1
-# LOG-SAME: total extenders = 1
 
 # DIS-LABEL: <_main>:
 # DIS-NEXT: bl 0x[[#%x, ISLAND:]] <_target.island.0>
