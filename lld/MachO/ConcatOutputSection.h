@@ -16,6 +16,8 @@
 
 namespace lld::macho {
 
+class Defined;
+
 // Linking multiple files will inevitably mean resolving sections in different
 // files that are labeled with the same segment and section name. This class
 // contains all such sections and writes the data from each section sequentially
@@ -64,11 +66,25 @@ private:
 // support thunk insertion.
 class TextOutputSection : public ConcatOutputSection {
 public:
+  struct ExtenderArtifact {
+    ConcatInputSection *isec;
+    Defined *sym;
+  };
+
+  struct MaterializedExtender {
+    ConcatInputSection *precedingInput;
+    ConcatInputSection *isec;
+    uint64_t modeledVA;
+  };
+
   explicit TextOutputSection(StringRef name)
       : ConcatOutputSection(name, TextKind) {}
   void finalizeContents() override {}
   void finalize() override;
-  ArrayRef<ConcatInputSection *> getThunks() const { return thunks; }
+  ExtenderArtifact synthesizeExtender(StringRef name, size_t size,
+                                      bool externalSymbol);
+  void finalizeWithExtenders(ArrayRef<MaterializedExtender>);
+  ArrayRef<ConcatInputSection *> getExtenders() const { return extenders; }
   void writeTo(uint8_t *buf) const override;
 
   static bool classof(const OutputSection *sec) {
@@ -76,10 +92,7 @@ public:
   }
 
 private:
-  class Finalizer;
-
-  std::vector<ConcatInputSection *> thunks;
-  bool branchRangeExtensionFinalized = false;
+  std::vector<ConcatInputSection *> extenders;
 };
 
 NamePair maybeRenameSection(NamePair key);

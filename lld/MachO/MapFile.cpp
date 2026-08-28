@@ -236,7 +236,7 @@ void macho::writeMapFile() {
   for (const OutputSegment *seg : outputSegments) {
     for (const OutputSection *osec : seg->getSections()) {
       if (auto *textOsec = dyn_cast<TextOutputSection>(osec)) {
-        printIsecArrSyms(textOsec->inputs, textOsec->getThunks());
+        printIsecArrSyms(textOsec->inputs, textOsec->getExtenders());
       } else if (auto *concatOsec = dyn_cast<ConcatOutputSection>(osec)) {
         printIsecArrSyms(concatOsec->inputs);
       } else if (is_contained(in.cStringSections, osec)) {

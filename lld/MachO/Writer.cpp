@@ -16,10 +16,12 @@
 #include "OutputSection.h"
 #include "OutputSegment.h"
 #include "SectionPriorities.h"
+#include "Sections.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
 #include "SyntheticSections.h"
 #include "Target.h"
+#include "TextOutputSegment.h"
 #include "UnwindInfoSection.h"
 
 #include "lld/Common/Arrays.h"
@@ -1173,18 +1175,41 @@ void Writer::finalizeLinkEditSegment() {
 void Writer::assignAddresses(OutputSegment *seg) {
   seg->fileOff = fileOff;
 
-  for (OutputSection *osec : seg->getSections()) {
+  ArrayRef<OutputSection *> outputSections = seg->getSections();
+  for (size_t sectionIndex = 0; sectionIndex < outputSections.size();) {
+    OutputSection *osec = outputSections[sectionIndex];
     if (!osec->isNeeded())
-      continue;
-    addr = alignToPowerOf2(addr, osec->align);
-    fileOff = alignToPowerOf2(fileOff, osec->align);
-    osec->addr = addr;
-    osec->fileOff = isZeroFill(osec->flags) ? 0 : fileOff;
-    osec->finalize();
-    osec->assignAddressesToStartEndSymbols();
+      ++sectionIndex;
+    else if (auto *first = dyn_cast<TextOutputSection>(osec);
+             first && target->usesExtenders() && canHostExtenders(osec)) {
+      addr = alignToPowerOf2(addr, osec->align);
+      first->addr = addr;
+      TextOutputSegment textSegment(*first);
+      size_t consumed = textSegment.finalize();
+      assert(consumed != 0 && sectionIndex + consumed <= outputSections.size());
 
-    addr += osec->getSize();
-    fileOff += osec->getFileSize();
+      for (TextOutputSection *textOsec : textSegment.getSections()) {
+        addr = alignToPowerOf2(addr, textOsec->align);
+        fileOff = alignToPowerOf2(fileOff, textOsec->align);
+        assert(textOsec->addr == addr);
+        textOsec->fileOff = fileOff;
+        textOsec->assignAddressesToStartEndSymbols();
+        addr += textOsec->getSize();
+        fileOff += textOsec->getFileSize();
+      }
+      sectionIndex += consumed;
+    } else {
+      addr = alignToPowerOf2(addr, osec->align);
+      fileOff = alignToPowerOf2(fileOff, osec->align);
+      osec->addr = addr;
+      osec->fileOff = isZeroFill(osec->flags) ? 0 : fileOff;
+      osec->finalize();
+      osec->assignAddressesToStartEndSymbols();
+
+      addr += osec->getSize();
+      fileOff += osec->getFileSize();
+      ++sectionIndex;
+    }
   }
 }
 

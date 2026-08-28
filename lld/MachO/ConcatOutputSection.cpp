@@ -10,6 +10,9 @@
 #include "Config.h"
 #include "OutputSegment.h"
 #include "Sections.h"
+#include "SymbolTable.h"
+#include "Symbols.h"
+#include "SyntheticSections.h"
 #include "lld/Common/CommonLinkerContext.h"
 #include "llvm/BinaryFormat/MachO.h"
 
@@ -46,23 +49,71 @@ void ConcatOutputSection::finalizeContents() {
     finalizeOne(isec);
 }
 
+TextOutputSection::ExtenderArtifact
+TextOutputSection::synthesizeExtender(StringRef name, size_t extenderSize,
+                                      bool externalSymbol) {
+  auto *isec = makeSyntheticInputSection(parent->name, this->name);
+  isec->parent = this;
+  Defined *sym;
+  if (externalSymbol)
+    sym = symtab->addDefined(
+        name, /*file=*/nullptr, isec, /*value=*/0, /*size=*/extenderSize,
+        /*isWeakDef=*/false, /*isPrivateExtern=*/true,
+        /*isReferencedDynamically=*/false, /*noDeadStrip=*/false,
+        /*isWeakDefCanBeHidden=*/false);
+  else
+    sym = make<Defined>(
+        name, /*file=*/nullptr, isec, /*value=*/0, /*size=*/extenderSize,
+        /*isWeakDef=*/false, /*isExternal=*/false,
+        /*isPrivateExtern=*/true, /*includeInSymtab=*/true,
+        /*isReferencedDynamically=*/false, /*noDeadStrip=*/false,
+        /*canOverrideWeakDef=*/false);
+  sym->used = true;
+  return {isec, sym};
+}
+
+void TextOutputSection::finalizeWithExtenders(
+    ArrayRef<MaterializedExtender> materializedExtenders) {
+  size = fileSize = 0;
+  extenders.clear();
+  size_t extenderIdx = 0;
+  for (ConcatInputSection *isec : inputs) {
+    finalizeOne(isec);
+    while (extenderIdx < materializedExtenders.size() &&
+           materializedExtenders[extenderIdx].precedingInput == isec) {
+      const MaterializedExtender &extender =
+          materializedExtenders[extenderIdx++];
+      finalizeOne(extender.isec);
+      assert(extender.isec->getVA() == extender.modeledVA);
+      extenders.push_back(extender.isec);
+    }
+  }
+  assert(extenderIdx == materializedExtenders.size());
+}
+
+void TextOutputSection::finalize() {
+  for (ConcatInputSection *isec : inputs)
+    finalizeOne(isec);
+}
+
 void ConcatOutputSection::writeTo(uint8_t *buf) const {
   for (ConcatInputSection *isec : inputs)
     isec->writeTo(buf + isec->outSecOff);
 }
 
 void TextOutputSection::writeTo(uint8_t *buf) const {
-  // Merge input sections from thunk & ordinary vectors
+  // Merge input sections from extender and ordinary vectors.
   size_t i = 0, ie = inputs.size();
-  size_t t = 0, te = thunks.size();
+  size_t t = 0, te = extenders.size();
   while (i < ie || t < te) {
     while (i < ie && (t == te || inputs[i]->empty() ||
-                      inputs[i]->outSecOff < thunks[t]->outSecOff)) {
+                      inputs[i]->outSecOff < extenders[t]->outSecOff)) {
       inputs[i]->writeTo(buf + inputs[i]->outSecOff);
       ++i;
     }
-    while (t < te && (i == ie || thunks[t]->outSecOff < inputs[i]->outSecOff)) {
-      thunks[t]->writeTo(buf + thunks[t]->outSecOff);
+    while (t < te &&
+           (i == ie || extenders[t]->outSecOff < inputs[i]->outSecOff)) {
+      extenders[t]->writeTo(buf + extenders[t]->outSecOff);
       ++t;
     }
   }
