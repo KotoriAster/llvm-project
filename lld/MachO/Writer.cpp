@@ -1174,6 +1174,7 @@ void Writer::finalizeLinkEditSegment() {
 
 void Writer::assignAddresses(OutputSegment *seg) {
   seg->fileOff = fileOff;
+  const bool planThunks = seg->needsThunks();
 
   ArrayRef<OutputSection *> outputSections = seg->getSections();
   for (size_t sectionIndex = 0; sectionIndex < outputSections.size();) {
@@ -1181,9 +1182,11 @@ void Writer::assignAddresses(OutputSegment *seg) {
     if (!osec->isNeeded())
       ++sectionIndex;
     else if (auto *first = dyn_cast<TextOutputSection>(osec);
-             first && target->usesExtenders() && canHostExtenders(osec)) {
-      addr = alignToPowerOf2(addr, osec->align);
-      first->addr = addr;
+             first && planThunks &&
+             (target->supportsExtender(ExtenderKind::island) ||
+              target->supportsExtender(ExtenderKind::thunk)) &&
+             osec->canHostExtenders()) {
+      first->addr = alignToPowerOf2(addr, osec->align);
       TextOutputSegment textSegment(*first);
       size_t consumed = textSegment.finalize();
       assert(consumed != 0 && sectionIndex + consumed <= outputSections.size());
@@ -1205,7 +1208,6 @@ void Writer::assignAddresses(OutputSegment *seg) {
       osec->fileOff = isZeroFill(osec->flags) ? 0 : fileOff;
       osec->finalize();
       osec->assignAddressesToStartEndSymbols();
-
       addr += osec->getSize();
       fileOff += osec->getFileSize();
       ++sectionIndex;

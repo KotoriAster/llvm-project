@@ -1,8 +1,8 @@
 # REQUIRES: aarch64
 
-## The furthest callsite drives the island spine and its fallback thunk. The
-## thunk is placed at the inward edge of the callsite's branch window, while
-## nearer callsites reuse the two islands.
+## The furthest callsite drives the fallback thunk, which is placed at the
+## inward edge of its branch window. The next callsite reuses that thunk, while
+## the callsite nearer the target uses an island.
 
 # RUN: rm -rf %t; mkdir %t
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %s -o %t/input.o
@@ -18,9 +18,7 @@
 # CHECK-NEXT: add x16, x16
 # CHECK-NEXT: br x16
 # CHECK: <_first_caller>:
-# CHECK-NEXT: bl 0x{{[0-9a-f]+}} <_target.island.1>
-# CHECK: <_target.island.1>:
-# CHECK-NEXT: b 0x{{[0-9a-f]+}} <_target.island.0>
+# CHECK-NEXT: bl 0x{{[0-9a-f]+}} <_target.thunk.0>
 # CHECK: <_near_caller>:
 # CHECK-NEXT: bl 0x{{[0-9a-f]+}} <_target.island.0>
 # CHECK: <_target.island.0>:

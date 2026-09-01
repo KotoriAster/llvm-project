@@ -43,6 +43,7 @@ public:
   void addOutputSection(OutputSection *os);
   void sortOutputSections();
   void assignAddressesToStartEndSymbols();
+  bool needsThunks() const;
 
   const std::vector<OutputSection *> &getSections() const { return sections; }
   size_t numNonHiddenSections() const;

@@ -33,9 +33,7 @@ struct ARM64 : ARM64Common {
   void writeObjCMsgSendStub(uint8_t *buf, Symbol *sym, uint64_t stubsAddr,
                             uint64_t &stubOffset, uint64_t selrefVA,
                             Symbol *objcMsgSend) const override;
-  bool usesExtenders() const override { return true; }
-  ExtenderKind getChainExtenderKind() const override;
-  ExtenderKind getFallbackExtenderKind() const override;
+  bool supportsExtender(ExtenderKind) const override { return true; }
   size_t getExtenderSize(ExtenderKind kind) const override;
   uint32_t getExtenderAlign(ExtenderKind kind) const override;
   StringRef getExtenderSuffix(ExtenderKind kind) const override;
@@ -47,9 +45,6 @@ struct ARM64 : ARM64Common {
   Symbol *getThunkBranchTarget(InputSection *thunk) const override;
   uint32_t getICFSafeThunkSize() const override;
 };
-
-static constexpr ExtenderKind branchIsland = 0;
-static constexpr ExtenderKind absoluteThunk = 1;
 
 } // namespace
 
@@ -170,7 +165,8 @@ static constexpr uint32_t thunkCode[] = {
     0xd61f0200, // 08: br    x16
 };
 
-static void populateThunk(InputSection *thunk, Symbol *funcSym, int64_t addend) {
+static void populateThunk(InputSection *thunk, Symbol *funcSym,
+                          int64_t addend) {
   thunk->align = 4;
   thunk->data = {reinterpret_cast<const uint8_t *>(thunkCode),
                  sizeof(thunkCode)};
@@ -200,54 +196,46 @@ static void populateIsland(InputSection *island, Symbol *funcSym,
                               /*referent=*/funcSym);
 }
 
-ExtenderKind ARM64::getChainExtenderKind() const { return branchIsland; }
-
-ExtenderKind ARM64::getFallbackExtenderKind() const { return absoluteThunk; }
-
 size_t ARM64::getExtenderSize(ExtenderKind kind) const {
   switch (kind) {
-  case branchIsland:
+  case ExtenderKind::island:
     return sizeof(islandCode);
-  case absoluteThunk:
+  case ExtenderKind::thunk:
     return sizeof(thunkCode);
-  default:
-    llvm_unreachable("unknown ARM64 branch range extender kind");
   }
+  llvm_unreachable("unknown ARM64 branch range extender kind");
 }
 
 uint32_t ARM64::getExtenderAlign(ExtenderKind kind) const {
   switch (kind) {
-  case branchIsland:
-  case absoluteThunk:
+  case ExtenderKind::island:
+  case ExtenderKind::thunk:
     return 4;
-  default:
-    llvm_unreachable("unknown ARM64 branch range extender kind");
   }
+  llvm_unreachable("unknown ARM64 branch range extender kind");
 }
 
 StringRef ARM64::getExtenderSuffix(ExtenderKind kind) const {
   switch (kind) {
-  case branchIsland:
+  case ExtenderKind::island:
     return ".island.";
-  case absoluteThunk:
+  case ExtenderKind::thunk:
     return ".thunk.";
-  default:
-    llvm_unreachable("unknown ARM64 branch range extender kind");
   }
+  llvm_unreachable("unknown ARM64 branch range extender kind");
 }
 
 void ARM64::populateExtender(InputSection *isec, ExtenderKind kind,
                              Symbol *funcSym, int64_t addend) const {
   switch (kind) {
-  case branchIsland:
+  case ExtenderKind::island:
     populateIsland(isec, funcSym, addend);
     return;
-  case absoluteThunk:
+  case ExtenderKind::thunk:
     populateThunk(isec, funcSym, addend);
     return;
-  default:
-    llvm_unreachable("unknown ARM64 branch range extender kind");
   }
+  llvm_unreachable("unknown ARM64 branch range extender kind");
 }
 
 // Just a single direct branch to the target function.

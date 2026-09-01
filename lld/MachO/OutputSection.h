@@ -49,6 +49,10 @@ public:
 
   // How much space the section occupies in the address space.
   virtual uint64_t getSize() const = 0;
+  // The size to use while assigning output-section addresses. Most sections
+  // are finalized before address assignment and can report getSize()
+  // directly; sections finalized as part of address assignment override this.
+  virtual uint64_t getSizeForAddressAssignment() const { return getSize(); }
   // How much space the section occupies in the file. Most sections are copied
   // as-is so their file size is the same as their address space size.
   virtual uint64_t getFileSize() const { return getSize(); }
@@ -57,6 +61,9 @@ public:
   virtual bool isHidden() const { return false; }
   // Unneeded sections are omitted entirely (header and body).
   virtual bool isNeeded() const { return true; }
+  // True when this section can interleave branch-range extenders with its
+  // inputs, allowing Writer to delegate its finalization to TextOutputSegment.
+  virtual bool canHostExtenders() const { return false; }
 
   // The implementations of this method can assume that it is only called right
   // before addresses get assigned to this particular OutputSection. In

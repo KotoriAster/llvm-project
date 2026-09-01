@@ -12,29 +12,16 @@
 #include "Target.h"
 #include "lld/Common/LLVM.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include <cstddef>
 #include <cstdint>
-#include <optional>
-#include <tuple>
 
 namespace lld::macho {
 
 class ConcatInputSection;
-class OutputSection;
 class TextOutputSection;
-struct Relocation;
-struct Callee;
 struct Extender;
-struct RelocRewrite;
-
-using CalleeKey = std::tuple<const void *, uint64_t, int64_t>;
-
-bool canHostExtenders(const OutputSection *osec);
 
 /*
 Boundaries are insertion points between isecs :
@@ -44,14 +31,17 @@ current isec (i)    planned extenders         alignment padding    next isec
 inputVA             getInputEndVA()           next extender VA    next inputVA
 */
 struct Boundary {
+  Boundary(ConcatInputSection *isec, TextOutputSection *section)
+      : isec(isec), section(section) {}
+
   uint64_t getInputEndVA() const;
   uint64_t getNextExtenderVA(ExtenderKind kind) const;
-  bool operator<(const Boundary &rhs) const { return ordinal < rhs.ordinal; }
   ConcatInputSection *isec;
-  uint32_t ordinal;
+  TextOutputSection *section;
   uint32_t reservedSize = 0;
   uint32_t plannedSize = 0;
   uint64_t inputVA = 0;
+  SmallVector<Extender *, 2> plannedExtenders;
 };
 
 enum class BoundaryPreference { lowest, highest };
@@ -72,18 +62,17 @@ public:
                                          ExtenderKind kind);
   void initializeExtenderPlacementBoundaries();
   void resetPlannedSpace() {
-    for (auto &boundary : boundaries)
+    for (auto &boundary : boundaries) {
       boundary.plannedSize = 0;
+      boundary.plannedExtenders.clear();
+    }
   }
-  bool growReservationsToPlannedSpace();
-
-  void forEachInputBoundary(
-      ArrayRef<TextOutputSection *> sections,
-      llvm::function_ref<void(TextOutputSection &, Boundary &)> fn);
 
 private:
+  // The table is populated once by the constructor and never reordered, so
+  // pointers handed to callees and coarse searches remain stable.
   SmallVector<Boundary, 0> boundaries;
-  SmallVector<uint32_t, 0> coarseBoundaryOrdinals;
+  SmallVector<Boundary *, 0> coarseBoundaries;
 };
 
 // The maximal consecutive run of compatible text output sections finalized as
@@ -99,39 +88,15 @@ public:
   ArrayRef<TextOutputSection *> getSections() const {
     return textOutputSections;
   }
+  size_t size() const { return textOutputSections.size(); }
 
 private:
-  enum class LayoutKind { reservation, proposal };
-
   TextOutputSection &first;
-  const uint32_t maxHops;
-  const ExtenderKind chainKind;
-  const ExtenderKind fallbackKind;
   SmallVector<TextOutputSection *, 4> textOutputSections;
   BoundaryTable boundaries;
-  llvm::DenseMap<ConcatInputSection *, Boundary *> inputBoundaries;
-  llvm::DenseMap<CalleeKey, Callee *> calleesByKey;
-  SmallVector<Extender *, 0> extenders;
-  SmallVector<RelocRewrite *, 0> relocRewrites;
-  llvm::DenseMap<OutputSection *, uint64_t> estimatedPostSegmentSecVAs;
-  uint64_t textEndVA = 0;
-  llvm::DenseSet<const Relocation *> requiredExtenderRelocs;
 
   static SmallVector<TextOutputSection *, 4>
   collectConsecutiveOutputSections(TextOutputSection &first);
-  void initializeCallee(Callee &, Symbol *, int64_t);
-  std::optional<uint64_t> estimatePostTextSectionVA(OutputSection *);
-  void walkLayout(LayoutKind);
-  Boundary *findChainBoundary(uint64_t callVA, uint64_t anchorVA);
-  Extender *planBranchExtensionExtender(Callee &, Boundary &, ExtenderKind);
-  Extender *findReusableExtender(Callee &, uint64_t) const;
-  Extender *placeChainExtender(Callee &, uint64_t);
-  Extender *placeFallbackExtender(Callee &, uint64_t);
-  void planBranchExtension();
-  bool recoverFromRejectedProposal();
-  template <typename Visitor> bool forEachIslandEdge(Visitor) const;
-  bool isLayoutValid() const;
-  void materializeAcceptedPlan();
 };
 
 } // namespace lld::macho

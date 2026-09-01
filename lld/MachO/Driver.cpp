@@ -1055,14 +1055,14 @@ static ICFLevel getICFLevel(const ArgList &args) {
 static uint32_t getBranchRangeExtensionMaxHops(const ArgList &args) {
   const Arg *arg = args.getLastArg(OPT_branch_range_extension_max_hops_eq);
   if (!arg)
-    return 2;
+    return defaultBranchRangeExtensionMaxHops;
 
   StringRef value = arg->getValue();
   uint32_t maxHops;
   if (!llvm::to_integer(value, maxHops)) {
-    error(arg->getSpelling() +
-          ": expected a non-negative integer, but got '" + value + "'");
-    return 2;
+    error(arg->getSpelling() + ": expected a non-negative integer, but got '" +
+          value + "'");
+    return defaultBranchRangeExtensionMaxHops;
   }
   return maxHops;
 }
@@ -2050,7 +2050,9 @@ bool link(ArrayRef<const char *> argsArr, llvm::raw_ostream &stdoutOS,
       config->emitChainedFixups || args.hasArg(OPT_init_offsets);
   config->emitRelativeMethodLists = shouldEmitRelativeMethodLists(args);
   config->icfLevel = getICFLevel(args);
-  config->branchRangeExtensionMaxHops = getBranchRangeExtensionMaxHops(args);
+  uint32_t configuredMaxHops = getBranchRangeExtensionMaxHops(args);
+  config->branchRangeExtensionMaxHops =
+      target->supportsExtender(ExtenderKind::island) ? configuredMaxHops : 0;
   config->keepICFStabs = args.hasArg(OPT_keep_icf_stabs);
   config->dedupStrings =
       args.hasFlag(OPT_deduplicate_strings, OPT_no_deduplicate_strings, true);

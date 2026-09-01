@@ -94,7 +94,8 @@ uint64_t Defined::getVA() const {
   if (!isec()->isFinal) {
     // A target arch that does not use branch range extenders ought never ask for
     // the address of a function that has not yet been finalized.
-    assert(target->usesExtenders());
+    assert(target->supportsExtender(ExtenderKind::island) ||
+           target->supportsExtender(ExtenderKind::thunk));
 
     // ConcatOutputSection::finalize() can seek the address of a
     // function before its address is assigned. The extender algorithm

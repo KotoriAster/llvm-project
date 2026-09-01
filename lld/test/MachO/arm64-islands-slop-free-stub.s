@@ -10,21 +10,42 @@
 # RUN:   --branch-range-extension-max-hops=4294967295 --verbose 2> %t/link.log
 # RUN: FileCheck %s --check-prefix=LOG --input-file=%t/link.log
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/out | FileCheck %s
+# RUN: %lld -arch arm64 -dylib -undefined dynamic_lookup -o %t/late %t/input.o \
+# RUN:   --branch-range-extension-max-hops=4294967295 \
+# RUN:   -rename_section __TEXT __stubs __TEXT __late_stubs \
+# RUN:   --verbose 2> %t/late.log
+# RUN: FileCheck %s --check-prefix=LATE-LOG --input-file=%t/late.log
+# RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/late | \
+# RUN:   FileCheck %s --check-prefix=LATE
 
 # LOG: branch extender for __TEXT,__text:
 # LOG-SAME: total extenders = 2
 
 # CHECK: <_main>:
-# CHECK-NEXT: bl 0x{{[0-9a-f]+}} <_external.island.1>
-# CHECK: <_external.island.1>:
-# CHECK-NEXT: b 0x{{[0-9a-f]+}} <_external.island.0>
+# CHECK-NEXT: bl 0x{{[0-9a-f]+}} <_external.island.0>
 # CHECK: <_external.island.0>:
+# CHECK-NEXT: b 0x{{[0-9a-f]+}} <_external.island.1>
+# CHECK: <_external.island.1>:
 # CHECK-NEXT: b 0x[[#%x, STUB:]] <{{.*}}>
 # CHECK: [[#STUB]] <__stubs>:
 # CHECK-NEXT: adrp x16
 # CHECK-NEXT: ldr x16
 # CHECK-NEXT: br x16
 # CHECK-NOT: <_external.thunk.
+
+## Renaming __stubs removes its special ordering priority and places it after
+## __const. Its modeled VA must include the intervening unfinalized section.
+# LATE-LOG: branch extender for __TEXT,__text:
+# LATE-LOG-SAME: total extenders = 1
+
+# LATE: <_main>:
+# LATE-NEXT: bl 0x{{[0-9a-f]+}} <_external.thunk.0>
+# LATE: <_external.thunk.0>:
+# LATE-NEXT: adrp x16
+# LATE-NEXT: add x16
+# LATE-NEXT: br x16
+# LATE: Disassembly of section __TEXT,__late_stubs:
+# LATE: <__late_stubs>:
 
 .subsections_via_symbols
 .text
@@ -47,8 +68,7 @@ _f1:
 _f2:
   ret
 
-## Keep a large unfinalized text-segment section between __text and __stubs.
-## Stub estimation must account for its input sizes before final addresses are
-## assigned.
+## The renamed-stub run keeps a large unfinalized text-segment section between
+## __text and __late_stubs.
 .section __TEXT,__const
 .space 0x8000000

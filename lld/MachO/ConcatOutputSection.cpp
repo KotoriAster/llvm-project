@@ -96,6 +96,26 @@ void TextOutputSection::finalize() {
     finalizeOne(isec);
 }
 
+uint64_t TextOutputSection::getSizeForAddressAssignment() const {
+  if (!inputs.empty() && inputs.front()->isFinal)
+    return getSize();
+
+  uint64_t size = 0;
+  for (const ConcatInputSection *isec : inputs) {
+    size = alignToPowerOf2(size, isec->align);
+    size += isec->getSize();
+  }
+  return size;
+}
+
+bool TextOutputSection::canHostExtenders() const {
+  // Some input-backed __TEXT sections, such as __cstring and __const, contain
+  // no instructions. Conversely, synthetic code sections cannot interleave
+  // extender input sections. Only an instruction-bearing TextOutputSection
+  // satisfies both requirements.
+  return sections::isCodeSection(name, parent->name, flags);
+}
+
 void ConcatOutputSection::writeTo(uint8_t *buf) const {
   for (ConcatInputSection *isec : inputs)
     isec->writeTo(buf + isec->outSecOff);

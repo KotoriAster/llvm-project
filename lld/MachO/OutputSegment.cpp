@@ -7,7 +7,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "OutputSegment.h"
-#include "ConcatOutputSection.h"
 #include "InputSection.h"
 #include "Sections.h"
 #include "Symbols.h"
@@ -21,6 +20,23 @@ using namespace llvm;
 using namespace llvm::MachO;
 using namespace lld;
 using namespace lld::macho;
+
+bool OutputSegment::needsThunks() const {
+  if (!target->supportsExtender(ExtenderKind::island) &&
+      !target->supportsExtender(ExtenderKind::thunk))
+    return false;
+
+  uint64_t endVA = addr;
+  for (const OutputSection *osec : sections) {
+    if (!osec->isNeeded())
+      continue;
+    endVA = alignToPowerOf2(endVA, osec->align);
+    endVA += osec->getSizeForAddressAssignment();
+  }
+  uint64_t span = endVA - addr;
+  return span > target->backwardBranchRange ||
+         span > target->forwardBranchRange;
+}
 
 static uint32_t initProt(StringRef name) {
   auto it = find_if(

@@ -33,8 +33,7 @@ class DylibSymbol;
 class InputSection;
 class ObjFile;
 
-// Branch range extension kind used for long jump in finalization.
-using ExtenderKind = uint8_t;
+enum class ExtenderKind : uint8_t { island, thunk };
 
 static_assert(static_cast<uint32_t>(UNWIND_X86_64_MODE_MASK) ==
                   static_cast<uint32_t>(UNWIND_X86_MODE_MASK) &&
@@ -104,13 +103,7 @@ public:
 
   virtual uint64_t getPageSize() const = 0;
 
-  virtual bool usesExtenders() const { return false; }
-  virtual ExtenderKind getChainExtenderKind() const {
-    llvm_unreachable("target does not use branch range extenders");
-  }
-  virtual ExtenderKind getFallbackExtenderKind() const {
-    llvm_unreachable("target does not use branch range extenders");
-  }
+  virtual bool supportsExtender(ExtenderKind) const { return false; }
   virtual size_t getExtenderSize(ExtenderKind kind) const {
     llvm_unreachable("target does not use branch range extenders");
   }

@@ -80,6 +80,8 @@ public:
   explicit TextOutputSection(StringRef name)
       : ConcatOutputSection(name, TextKind) {}
   void finalizeContents() override {}
+  uint64_t getSizeForAddressAssignment() const override;
+  bool canHostExtenders() const override;
   void finalize() override;
   ExtenderArtifact synthesizeExtender(StringRef name, size_t size,
                                       bool externalSymbol);

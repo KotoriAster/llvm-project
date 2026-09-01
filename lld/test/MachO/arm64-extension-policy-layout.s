@@ -17,11 +17,11 @@
 ##                 down target <= down.thunk.0 <-- _downward_main
 ##
 ##   maxHops=2:   _main --> one.i0 --------------------> _one_hop
-##                      --> two.i1 --> two.i0 ----------> _two_hop
+##                      --> two.i0 --> two.i1 ----------> _two_hop
 ##                      --> three.thunk.0 =============> _three_hop
 ##                 down target <= down.thunk.0 <-------- _downward_main
 ##
-##   maxHops=inf: _main --> three.i2 --> three.i1 --> three.i0 --> _three_hop
+##   maxHops=inf: _main --> three.i0 --> three.i1 --> three.i2 --> _three_hop
 ##                 down target <-- down.i0 <-- down.i1 <-- down.i2 <-- down main
 
 # RUN: rm -rf %t; mkdir %t
@@ -70,17 +70,17 @@
 
 # HYBRID-LABEL: <_main>:
 # HYBRID-NEXT: bl 0x{{[0-9a-f]+}} <_one_hop.island.0>
-# HYBRID-NEXT: bl 0x{{[0-9a-f]+}} <_two_hop.island.1>
+# HYBRID-NEXT: bl 0x{{[0-9a-f]+}} <_two_hop.island.0>
 # HYBRID-NEXT: bl 0x{{[0-9a-f]+}} <_three_hop.thunk.0>
 # HYBRID: <_one_hop.island.0>:
 # HYBRID-NEXT: b 0x{{[0-9a-f]+}} <_one_hop>
-# HYBRID: <_two_hop.island.1>:
-# HYBRID-NEXT: b 0x{{[0-9a-f]+}} <_two_hop.island.0>
+# HYBRID: <_two_hop.island.0>:
+# HYBRID-NEXT: b 0x{{[0-9a-f]+}} <_two_hop.island.1>
 # HYBRID: <_three_hop.thunk.0>:
 # HYBRID-NEXT: adrp x16
 # HYBRID-NEXT: add x16, x16
 # HYBRID-NEXT: br x16
-# HYBRID: <_two_hop.island.0>:
+# HYBRID: <_two_hop.island.1>:
 # HYBRID-NEXT: b 0x{{[0-9a-f]+}} <_two_hop>
 # HYBRID: <_three_hop_down.thunk.0>:
 # HYBRID-NEXT: adrp x16
@@ -91,23 +91,23 @@
 
 # ISLANDS-LABEL: <_main>:
 # ISLANDS-NEXT: bl 0x{{[0-9a-f]+}} <_one_hop.island.0>
-# ISLANDS-NEXT: bl 0x{{[0-9a-f]+}} <_two_hop.island.1>
-# ISLANDS-NEXT: bl 0x{{[0-9a-f]+}} <_three_hop.island.2>
+# ISLANDS-NEXT: bl 0x{{[0-9a-f]+}} <_two_hop.island.0>
+# ISLANDS-NEXT: bl 0x{{[0-9a-f]+}} <_three_hop.island.0>
 # ISLANDS: <_one_hop.island.0>:
 # ISLANDS-NEXT: b 0x{{[0-9a-f]+}} <_one_hop>
-# ISLANDS: <_two_hop.island.1>:
-# ISLANDS-NEXT: b 0x{{[0-9a-f]+}} <_two_hop.island.0>
-# ISLANDS: <_three_hop.island.2>:
+# ISLANDS: <_two_hop.island.0>:
+# ISLANDS-NEXT: b 0x{{[0-9a-f]+}} <_two_hop.island.1>
+# ISLANDS: <_three_hop.island.0>:
 # ISLANDS-NEXT: b 0x{{[0-9a-f]+}} <_three_hop.island.1>
 # ISLANDS: <_three_hop_down.island.0>:
 # ISLANDS-NEXT: b 0x{{[0-9a-f]+}} <_three_hop_down>
-# ISLANDS: <_two_hop.island.0>:
+# ISLANDS: <_two_hop.island.1>:
 # ISLANDS-NEXT: b 0x{{[0-9a-f]+}} <_two_hop>
 # ISLANDS: <_three_hop.island.1>:
-# ISLANDS-NEXT: b 0x{{[0-9a-f]+}} <_three_hop.island.0>
+# ISLANDS-NEXT: b 0x{{[0-9a-f]+}} <_three_hop.island.2>
 # ISLANDS: <_three_hop_down.island.1>:
 # ISLANDS-NEXT: b 0x{{[0-9a-f]+}} <_three_hop_down.island.0>
-# ISLANDS: <_three_hop.island.0>:
+# ISLANDS: <_three_hop.island.2>:
 # ISLANDS-NEXT: b 0x{{[0-9a-f]+}} <_three_hop>
 # ISLANDS: <_three_hop_down.island.2>:
 # ISLANDS-NEXT: b 0x{{[0-9a-f]+}} <_three_hop_down.island.1>

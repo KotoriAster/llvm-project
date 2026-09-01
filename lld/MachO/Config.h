@@ -79,6 +79,8 @@ enum class ObjCStubsMode {
   small,
 };
 
+inline constexpr uint32_t defaultBranchRangeExtensionMaxHops = 2;
+
 struct SectionAlign {
   llvm::StringRef segName;
   llvm::StringRef sectName;
@@ -201,7 +203,7 @@ struct Configuration {
   UndefinedSymbolTreatment undefinedSymbolTreatment =
       UndefinedSymbolTreatment::error;
   ICFLevel icfLevel = ICFLevel::none;
-  uint32_t branchRangeExtensionMaxHops = 2;
+  uint32_t branchRangeExtensionMaxHops = defaultBranchRangeExtensionMaxHops;
   bool keepICFStabs = false;
   ObjCStubsMode objcStubsMode = ObjCStubsMode::fast;
   llvm::MachO::HeaderFileType outputType;
