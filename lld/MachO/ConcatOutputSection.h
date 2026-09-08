@@ -13,6 +13,9 @@
 #include "OutputSection.h"
 #include "lld/Common/LLVM.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SmallVector.h"
+
+#include <optional>
 
 namespace lld::macho {
 
@@ -66,15 +69,16 @@ private:
 // support thunk insertion.
 class TextOutputSection : public ConcatOutputSection {
 public:
+  // The synthesized input section and the symbol used to reference it.
   struct ExtenderArtifact {
     ConcatInputSection *isec;
     Defined *sym;
   };
 
-  struct MaterializedExtender {
-    ConcatInputSection *precedingInput;
-    ConcatInputSection *isec;
-    uint64_t modeledVA;
+  // An extender and its insertion position among the original inputs.
+  struct ExtenderPlacement {
+    ConcatInputSection *insertAfter;
+    ConcatInputSection *extender;
   };
 
   explicit TextOutputSection(StringRef name)
@@ -85,7 +89,10 @@ public:
   void finalize() override;
   ExtenderArtifact synthesizeExtender(StringRef name, size_t size,
                                       bool externalSymbol);
-  void finalizeWithExtenders(ArrayRef<MaterializedExtender>);
+  // Set once, before Writer calls finalize(). Materialization produces these
+  // placements in boundary/input order.
+  void setExtenderPlacements(SmallVector<ExtenderPlacement, 0> &&placements,
+                             uint64_t expectedSize);
   ArrayRef<ConcatInputSection *> getExtenders() const { return extenders; }
   void writeTo(uint8_t *buf) const override;
 
@@ -94,6 +101,8 @@ public:
   }
 
 private:
+  SmallVector<ExtenderPlacement, 0> materializedExtenders;
+  std::optional<uint64_t> plannedSize;
   std::vector<ConcatInputSection *> extenders;
 };
 

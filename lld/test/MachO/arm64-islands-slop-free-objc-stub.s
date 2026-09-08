@@ -34,7 +34,7 @@
 ## Giving __objc_stubs the header priority moves it before __text. The planner
 ## must use its already assigned address instead of assuming a suffix target.
 # FRONT-LOG: branch extender for __TEXT,__text:
-# FRONT-LOG-SAME: targets = 0, total extenders = 0
+# FRONT-LOG-SAME: total extenders = 0
 
 # FRONT: Disassembly of section __TEXT,__mach_header:
 # FRONT: <_objc_msgSend$foo>:

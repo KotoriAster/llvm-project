@@ -1,14 +1,15 @@
 # REQUIRES: aarch64
 
-## The furthest callsite drives the fallback thunk, which is placed at the
-## inward edge of its branch window. The next callsite reuses that thunk, while
-## the callsite nearer the target uses an island.
+## Visit callers from the target outward. The nearest caller uses one island,
+## and the next caller extends that chain with a second island. The furthest
+## caller exceeds the two-hop budget and uses a fallback thunk. Failed attempts
+## to extend or rebuild its chain must leave only the two used islands.
 
 # RUN: rm -rf %t; mkdir %t
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %s -o %t/input.o
 # RUN: %lld -arch arm64 -dylib -undefined dynamic_lookup -o %t/out %t/input.o \
 # RUN:   --branch-range-extension-max-hops=2
-# RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/out | FileCheck %s
+# RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t/out | FileCheck %s --implicit-check-not='.island.2'
 # RUN: llvm-nm -n %t/out | FileCheck %s --check-prefix=NM
 
 # CHECK: <_far_caller>:
@@ -18,16 +19,18 @@
 # CHECK-NEXT: add x16, x16
 # CHECK-NEXT: br x16
 # CHECK: <_first_caller>:
-# CHECK-NEXT: bl 0x{{[0-9a-f]+}} <_target.thunk.0>
-# CHECK: <_near_caller>:
 # CHECK-NEXT: bl 0x{{[0-9a-f]+}} <_target.island.0>
 # CHECK: <_target.island.0>:
+# CHECK-NEXT: b 0x{{[0-9a-f]+}} <_target.island.1>
+# CHECK: <_near_caller>:
+# CHECK-NEXT: bl 0x{{[0-9a-f]+}} <_target.island.1>
+# CHECK: <_target.island.1>:
 # CHECK-NEXT: b 0x{{[0-9a-f]+}} <_target>
 
-## The thunk uses the boundary 127 MiB above the furthest callsite, rather than
-## coupling its placement to the island-aligned boundary at 119 MiB.
+## Choose the nearest legal boundary, 119 MiB above the furthest callsite,
+## even though the boundary at 127 MiB is also reachable.
 # NM: [[#%x,FAR:]] T _far_caller
-# NM: [[#FAR + 0x7f00000]] t _target.thunk.0
+# NM: [[#FAR + 0x7700000]] t _target.thunk.0
 
 .subsections_via_symbols
 

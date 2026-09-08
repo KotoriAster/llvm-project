@@ -1177,40 +1177,35 @@ void Writer::assignAddresses(OutputSegment *seg) {
   const bool planThunks = seg->needsThunks();
 
   ArrayRef<OutputSection *> outputSections = seg->getSections();
-  for (size_t sectionIndex = 0; sectionIndex < outputSections.size();) {
-    OutputSection *osec = outputSections[sectionIndex];
-    if (!osec->isNeeded())
-      ++sectionIndex;
-    else if (auto *first = dyn_cast<TextOutputSection>(osec);
-             first && planThunks &&
-             (target->supportsExtender(ExtenderKind::island) ||
-              target->supportsExtender(ExtenderKind::thunk)) &&
-             osec->canHostExtenders()) {
-      first->addr = alignToPowerOf2(addr, osec->align);
-      TextOutputSegment textSegment(*first);
-      size_t consumed = textSegment.finalize();
-      assert(consumed != 0 && sectionIndex + consumed <= outputSections.size());
+  for (auto it = outputSections.begin(); it != outputSections.end();) {
+    OutputSection *osec = *it;
+    if (!osec->isNeeded()) {
+      ++it;
+      continue;
+    }
 
-      for (TextOutputSection *textOsec : textSegment.getSections()) {
-        addr = alignToPowerOf2(addr, textOsec->align);
-        fileOff = alignToPowerOf2(fileOff, textOsec->align);
-        assert(textOsec->addr == addr);
-        textOsec->fileOff = fileOff;
-        textOsec->assignAddressesToStartEndSymbols();
-        addr += textOsec->getSize();
-        fileOff += textOsec->getFileSize();
-      }
-      sectionIndex += consumed;
-    } else {
+    auto next = std::next(it);
+    const bool planExtenders = planThunks && osec->canHostExtenders();
+    if (planExtenders) {
+      osec->addr = alignToPowerOf2(addr, osec->align);
+      TextOutputSegment textSegment(it, outputSections.end());
+      next = textSegment.planBranchRangeExtension();
+    }
+
+    // Finalize and assign placement for the planned text run or a single
+    // section.
+    for (; it != next; ++it) {
+      osec = *it;
       addr = alignToPowerOf2(addr, osec->align);
       fileOff = alignToPowerOf2(fileOff, osec->align);
+      if (planExtenders)
+        assert(osec->addr == addr);
       osec->addr = addr;
       osec->fileOff = isZeroFill(osec->flags) ? 0 : fileOff;
       osec->finalize();
       osec->assignAddressesToStartEndSymbols();
       addr += osec->getSize();
       fileOff += osec->getFileSize();
-      ++sectionIndex;
     }
   }
 }

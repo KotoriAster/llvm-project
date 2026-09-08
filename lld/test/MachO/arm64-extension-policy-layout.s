@@ -45,10 +45,6 @@
 # RUN:   | FileCheck %s --check-prefix=ISLANDS
 # RUN: rm %t/islands
 
-# THUNKS-LABEL: <_main>:
-# THUNKS-NEXT: bl 0x{{[0-9a-f]+}} <_one_hop.thunk.0>
-# THUNKS-NEXT: bl 0x{{[0-9a-f]+}} <_two_hop.thunk.0>
-# THUNKS-NEXT: bl 0x{{[0-9a-f]+}} <_three_hop.thunk.0>
 # THUNKS: <_one_hop.thunk.0>:
 # THUNKS-NEXT: adrp x16
 # THUNKS-NEXT: add x16, x16
@@ -61,6 +57,10 @@
 # THUNKS-NEXT: adrp x16
 # THUNKS-NEXT: add x16, x16
 # THUNKS-NEXT: br x16
+# THUNKS-LABEL: <_main>:
+# THUNKS-NEXT: bl 0x{{[0-9a-f]+}} <_one_hop.thunk.0>
+# THUNKS-NEXT: bl 0x{{[0-9a-f]+}} <_two_hop.thunk.0>
+# THUNKS-NEXT: bl 0x{{[0-9a-f]+}} <_three_hop.thunk.0>
 # THUNKS: <_three_hop_down.thunk.0>:
 # THUNKS-NEXT: adrp x16
 # THUNKS-NEXT: add x16, x16
@@ -68,6 +68,10 @@
 # THUNKS: <_downward_main>:
 # THUNKS-NEXT: bl 0x{{[0-9a-f]+}} <_three_hop_down.thunk.0>
 
+# HYBRID: <_three_hop.thunk.0>:
+# HYBRID-NEXT: adrp x16
+# HYBRID-NEXT: add x16, x16
+# HYBRID-NEXT: br x16
 # HYBRID-LABEL: <_main>:
 # HYBRID-NEXT: bl 0x{{[0-9a-f]+}} <_one_hop.island.0>
 # HYBRID-NEXT: bl 0x{{[0-9a-f]+}} <_two_hop.island.0>
@@ -76,10 +80,6 @@
 # HYBRID-NEXT: b 0x{{[0-9a-f]+}} <_one_hop>
 # HYBRID: <_two_hop.island.0>:
 # HYBRID-NEXT: b 0x{{[0-9a-f]+}} <_two_hop.island.1>
-# HYBRID: <_three_hop.thunk.0>:
-# HYBRID-NEXT: adrp x16
-# HYBRID-NEXT: add x16, x16
-# HYBRID-NEXT: br x16
 # HYBRID: <_two_hop.island.1>:
 # HYBRID-NEXT: b 0x{{[0-9a-f]+}} <_two_hop>
 # HYBRID: <_three_hop_down.thunk.0>:

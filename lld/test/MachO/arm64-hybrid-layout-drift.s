@@ -35,3 +35,9 @@ _mid:
 .p2align 2
 _far:
   ret
+
+## Raise the input section alignment after the earlier subsections. The
+## planner and finalizer must agree on the aligned layout.
+.p2align 12
+_aligned:
+  ret

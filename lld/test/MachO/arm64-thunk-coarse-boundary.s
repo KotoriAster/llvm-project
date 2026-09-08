@@ -1,18 +1,9 @@
 # REQUIRES: aarch64
 
-## Prefer a coarse boundary over a denser boundary even when the latter is
-## farther inward in the thunk's legal placement window. The coarse boundary
-## follows _coarse; the boundary following _dense is only 256 KiB later and is
-## therefore omitted from the 1 MiB-spaced coarse catalog.
-
-## layout: 
-##
-##   0             ~112 MiB  ~112.25 MiB    +128 MiB - 4 B    ~256.25 MiB
-##   |                  |          |                |                 |
-## _main       coarse boundary  dense boundary  BL limit          _target
-##   |----------------->|          |                |
-##                chosen thunk     `-- also legal --'
-##
+## Thunks use the nearest legal dense boundary, even when it is omitted from
+## the coarse catalog. The call is 16 bytes into _main: its own boundary is
+## 8 bytes ahead, closer than the coarse boundary immediately before _main.
+## The distant coarse and dense boundaries are also reachable candidates.
 
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %s -o %t.o
 # RUN: %lld -arch arm64 -dylib -o %t %t.o \
@@ -20,18 +11,35 @@
 # RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t \
 # RUN:   | FileCheck %s
 
-# CHECK-LABEL: <_main>:
-# CHECK-NEXT: bl 0x[[#%x, THUNK:]] <_target.thunk.0>
-# CHECK-LABEL: <_coarse>:
-# CHECK: [[#%x, THUNK]] <_target.thunk.0>:
-# CHECK-LABEL: <_dense>:
 # CHECK-LABEL: <_target>:
+# CHECK: [[#%x, MAIN:]] <_main>:
+# CHECK: bl 0x[[#MAIN + 24]] <_target.thunk.0>
+# CHECK-NEXT: ret
+# CHECK: [[#MAIN + 24]] <_target.thunk.0>:
+# CHECK-NEXT: adrp x16
+# CHECK-NEXT: add x16, x16
+# CHECK-NEXT: br x16
+# CHECK-LABEL: <_coarse>:
+# CHECK-LABEL: <_dense>:
+# CHECK-LABEL: <_end>:
 
 .subsections_via_symbols
 .text
 
+.globl _target
+_target:
+  ret
+
+.globl _padding
+_padding:
+  .space 0x9000000
+
 .globl _main
 _main:
+  nop
+  nop
+  nop
+  nop
   bl _target
   ret
 
@@ -47,6 +55,6 @@ _dense:
 _gap:
   .space 0x9000000
 
-.globl _target
-_target:
+.globl _end
+_end:
   ret

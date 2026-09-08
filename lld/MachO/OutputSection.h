@@ -62,7 +62,8 @@ public:
   // Unneeded sections are omitted entirely (header and body).
   virtual bool isNeeded() const { return true; }
   // True when this section can interleave branch-range extenders with its
-  // inputs, allowing Writer to delegate its finalization to TextOutputSegment.
+  // inputs, allowing TextOutputSegment to plan their placement before Writer
+  // finalizes the section.
   virtual bool canHostExtenders() const { return false; }
 
   // The implementations of this method can assume that it is only called right

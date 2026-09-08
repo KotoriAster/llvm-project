@@ -7,6 +7,8 @@
 
 # CHECK-LABEL: Disassembly of section __TEXT,__text:
 
+## Plan each callee independently, placing its thunk near _foo and sharing it
+## with _main. Distinct targets must retain distinct thunks.
 # CHECK-LABEL: <_main>:
 # CHECK-NEXT:    bl
 # CHECK-NEXT:    bl 0x[[#%x,THUNK:]] <_extern_sym.thunk.0>
@@ -14,15 +16,16 @@
 # CHECK-NEXT:    bl 0x[[#%x,THUNK_BAR:]] <_objc_msgSend$bar.thunk.0>
 # CHECK-NEXT:    ret
 
-# CHECK-DAG: [[#THUNK]] <_extern_sym.thunk.0>:
-# CHECK-DAG: [[#THUNK_FOO]] <_objc_msgSend$foo.thunk.0>:
-# CHECK-DAG: [[#THUNK_BAR]] <_objc_msgSend$bar.thunk.0>:
+# CHECK: [[#THUNK]] <_extern_sym.thunk.0>:
+# CHECK: [[#THUNK_FOO]] <_objc_msgSend$foo.thunk.0>:
 
 # CHECK-LABEL: <_foo>:
-# CHECK-NEXT:    bl 0x[[#%x,THUNK:]] <_extern_sym.thunk.0>
-# CHECK-NEXT:    bl 0x[[#%x,THUNK_FOO:]] <_objc_msgSend$foo.thunk.0>
-# CHECK-NEXT:    bl 0x[[#%x,THUNK_BAR:]] <_objc_msgSend$bar.thunk.0>
+# CHECK-NEXT:    bl 0x[[#THUNK]] <_extern_sym.thunk.0>
+# CHECK-NEXT:    bl 0x[[#THUNK_FOO]] <_objc_msgSend$foo.thunk.0>
+# CHECK-NEXT:    bl 0x[[#THUNK_BAR]] <_objc_msgSend$bar.thunk.0>
 # CHECK-NEXT:    ret
+
+# CHECK: [[#THUNK_BAR]] <_objc_msgSend$bar.thunk.0>:
 
 # CHECK-LABEL: Disassembly of section __TEXT,__stubs:
 # CHECK-LABEL: Disassembly of section __TEXT,__objc_stubs:

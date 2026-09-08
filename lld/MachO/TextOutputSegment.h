@@ -20,16 +20,17 @@
 namespace lld::macho {
 
 class ConcatInputSection;
+class OutputSection;
 class TextOutputSection;
 struct Extender;
 
-/*
-Boundaries are insertion points between isecs :
-current isec (i)    planned extenders         alignment padding    next isec
-(i+1)
-|-------------------|-----boundary (i)--------|....................|
-inputVA             getInputEndVA()           next extender VA    next inputVA
-*/
+/// Models an insertion point between input sections.
+///
+/// \code
+/// current isec (i)  planned extenders   padding      next isec (i+1)
+/// |----------------|--- boundary (i) ---|............|
+/// inputVA          getInputEndVA()     next extender VA  next inputVA
+/// \endcode
 struct Boundary {
   Boundary(ConcatInputSection *isec, TextOutputSection *section)
       : isec(isec), section(section) {}
@@ -60,7 +61,7 @@ public:
   Boundary *findExtenderPlacementInRange(uint64_t lowVA, uint64_t highVA,
                                          BoundaryPreference preference,
                                          ExtenderKind kind);
-  void initializeExtenderPlacementBoundaries();
+  Boundary *findExtenderPlacementNear(uint64_t callVA, ExtenderKind kind);
   void resetPlannedSpace() {
     for (auto &boundary : boundaries) {
       boundary.plannedSize = 0;
@@ -69,34 +70,43 @@ public:
   }
 
 private:
-  // The table is populated once by the constructor and never reordered, so
-  // pointers handed to callees and coarse searches remain stable.
+  // Search coarse boundaries before the full table to concentrate extenders at
+  // shared boundaries for locality.
   SmallVector<Boundary, 0> boundaries;
   SmallVector<Boundary *, 0> coarseBoundaries;
 };
 
-// The maximal consecutive run of compatible text output sections finalized as
-// one branch-range-extension unit.
+/// A maximal consecutive run of text output sections that can host extenders.
+///
+/// The run starts at `first` and ends immediately before the next output
+/// section that cannot host extenders.
+///
+/// Extender insertion can shift every later input and output section in the
+/// run, so all member sections are planned as one branch-range-extension unit.
+/// `planBranchRangeExtension()` stores the accepted extender placements for
+/// Writer to finalize and returns the iterator to the first section after the
+/// run, allowing Writer to continue iterating over the remaining output
+/// sections.
 class TextOutputSegment {
 public:
-  explicit TextOutputSegment(TextOutputSection &first);
+  using iterator = ArrayRef<OutputSection *>::iterator;
+
+  TextOutputSegment(iterator first, iterator end);
 
   TextOutputSegment(const TextOutputSegment &) = delete;
   TextOutputSegment &operator=(const TextOutputSegment &) = delete;
 
-  size_t finalize();
+  iterator planBranchRangeExtension();
   ArrayRef<TextOutputSection *> getSections() const {
     return textOutputSections;
   }
   size_t size() const { return textOutputSections.size(); }
 
 private:
-  TextOutputSection &first;
   SmallVector<TextOutputSection *, 4> textOutputSections;
-  BoundaryTable boundaries;
 
-  static SmallVector<TextOutputSection *, 4>
-  collectConsecutiveOutputSections(TextOutputSection &first);
+  // Iterator to fist osec behind current TextOutputSegment
+  iterator next;
 };
 
 } // namespace lld::macho

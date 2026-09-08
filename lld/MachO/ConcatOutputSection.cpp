@@ -72,28 +72,33 @@ TextOutputSection::synthesizeExtender(StringRef name, size_t extenderSize,
   return {isec, sym};
 }
 
-void TextOutputSection::finalizeWithExtenders(
-    ArrayRef<MaterializedExtender> materializedExtenders) {
-  size = fileSize = 0;
-  extenders.clear();
-  size_t extenderIdx = 0;
-  for (ConcatInputSection *isec : inputs) {
-    finalizeOne(isec);
-    while (extenderIdx < materializedExtenders.size() &&
-           materializedExtenders[extenderIdx].precedingInput == isec) {
-      const MaterializedExtender &extender =
-          materializedExtenders[extenderIdx++];
-      finalizeOne(extender.isec);
-      assert(extender.isec->getVA() == extender.modeledVA);
-      extenders.push_back(extender.isec);
-    }
-  }
-  assert(extenderIdx == materializedExtenders.size());
+void TextOutputSection::setExtenderPlacements(
+    SmallVector<ExtenderPlacement, 0> &&placements, uint64_t expectedSize) {
+  assert(extenders.empty() && "extenders have already been finalized");
+  assert(!plannedSize && materializedExtenders.empty() &&
+         "extender placements have already been set");
+  materializedExtenders = std::move(placements);
+  plannedSize = expectedSize;
 }
 
 void TextOutputSection::finalize() {
-  for (ConcatInputSection *isec : inputs)
+  assert(size == 0 && fileSize == 0 && extenders.empty() &&
+         "text section has already been finalized");
+  auto placementIt = materializedExtenders.begin();
+  for (auto *isec : inputs) {
+    assert(!isec->isFinal && "input section has already been finalized");
     finalizeOne(isec);
+    while (placementIt != materializedExtenders.end() &&
+           placementIt->insertAfter == isec) {
+      finalizeOne(placementIt->extender);
+      extenders.push_back(placementIt->extender);
+      ++placementIt;
+    }
+  }
+  assert(placementIt == materializedExtenders.end() &&
+         "not all extender placements were consumed");
+  assert((!plannedSize || size == *plannedSize) &&
+         "finalized section size differs from extender plan");
 }
 
 uint64_t TextOutputSection::getSizeForAddressAssignment() const {

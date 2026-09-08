@@ -50,10 +50,14 @@ static bool inBranchRange(uint64_t from, uint64_t to) {
 template <typename BoundaryRange, typename Predicate>
 static Boundary *findInDirection(BoundaryRange &&boundaries, bool ascending,
                                  Predicate predicate) {
-  for (auto *boundary : llvm::reverse_conditionally(boundaries, !ascending))
-    if (predicate(*boundary))
-      return boundary;
-  return nullptr;
+  auto findInRange = [&](auto &&range) -> Boundary * {
+    for (auto *boundary : range)
+      if (predicate(*boundary))
+        return boundary;
+    return nullptr;
+  };
+  return ascending ? findInRange(boundaries)
+                   : findInRange(llvm::reverse(boundaries));
 }
 
 namespace lld::macho {
@@ -65,30 +69,33 @@ uint64_t Boundary::getNextExtenderVA(ExtenderKind kind) const {
 }
 
 BoundaryTable::BoundaryTable(ArrayRef<TextOutputSection *> sections) {
+  size_t inputCount = 0;
   for (auto *section : sections)
-    for (auto *isec : section->inputs)
-      boundaries.emplace_back(isec, section);
-}
+    inputCount += section->inputs.size();
+  assert(inputCount && "text output segment must contain an input section");
+  // Keep pointers in coarseBoundaries stable while collecting inputs.
+  boundaries.reserve(inputCount);
 
-void BoundaryTable::initializeExtenderPlacementBoundaries() {
-  // Boundary spacing is set to be 1MiB for linking performance
-  // and locality.
+  // Select coarse boundaries once from input sizes and alignment, before any
+  // extenders are reserved. Space them 1 MiB apart for performance and
+  // locality.
   constexpr uint64_t boundarySpacing = 1024 * 1024;
-  if (!coarseBoundaries.empty() || boundaries.empty())
-    return;
-
-  coarseBoundaries.push_back(&boundaries.front());
-  uint64_t lastVA = boundaries.front().getInputEndVA();
-  for (auto &boundary : llvm::drop_begin(boundaries)) {
-    if (&boundary == &boundaries.back())
-      break;
-    uint64_t va = boundary.getInputEndVA();
-    if (va - lastVA < boundarySpacing)
-      continue;
-    coarseBoundaries.push_back(&boundary);
-    lastVA = va;
+  uint64_t va = sections.front()->addr;
+  uint64_t lastVA = va;
+  for (auto *section : sections) {
+    va = alignToPowerOf2(va, section->align);
+    uint64_t sectionVA = va;
+    for (auto *isec : section->inputs) {
+      boundaries.emplace_back(isec, section);
+      va = sectionVA + alignToPowerOf2(va - sectionVA, isec->align) +
+           isec->getSize();
+      if (coarseBoundaries.empty() || va - lastVA >= boundarySpacing) {
+        coarseBoundaries.push_back(&boundaries.back());
+        lastVA = va;
+      }
+    }
   }
-  if (boundaries.size() > 1)
+  if (coarseBoundaries.back() != &boundaries.back())
     coarseBoundaries.push_back(&boundaries.back());
 }
 
@@ -113,8 +120,8 @@ BoundaryTable::findExtenderPlacementInRange(uint64_t lowVA, uint64_t highVA,
                                      [](uint64_t va, const Boundary *boundary) {
                                        return va < boundary->getInputEndVA();
                                      });
-  if (Boundary *boundary = findInDirection(
-          llvm::make_range(coarseBegin, coarseEnd), ascending, isUsable))
+  if (auto *boundary = findInDirection(llvm::make_range(coarseBegin, coarseEnd),
+                                       ascending, isUsable))
     return boundary;
 
   auto begin = llvm::partition_point(boundaries, [&](const Boundary &boundary) {
@@ -127,27 +134,89 @@ BoundaryTable::findExtenderPlacementInRange(uint64_t lowVA, uint64_t highVA,
                          ascending, isUsable);
 }
 
+Boundary *BoundaryTable::findExtenderPlacementNear(uint64_t callVA,
+                                                   ExtenderKind kind) {
+  auto baseVA = [kind](const Boundary &boundary) {
+    return alignToPowerOf2(boundary.getInputEndVA(),
+                           target->getExtenderAlign(kind));
+  };
+  uint64_t lowVA = subSat(callVA, target->backwardBranchRange);
+  uint64_t highVA = addSat(callVA, target->forwardBranchRange);
+  auto begin = llvm::partition_point(boundaries, [&](const Boundary &boundary) {
+    return baseVA(boundary) < lowVA;
+  });
+  auto end = llvm::partition_point(boundaries, [&](const Boundary &boundary) {
+    return baseVA(boundary) <= highVA;
+  });
+  auto left = llvm::partition_point(boundaries, [&](const Boundary &boundary) {
+    return baseVA(boundary) < callVA;
+  });
+  auto right = left;
+  // Walk dense boundaries in order of distance from the caller. Check the
+  // actual placement too, since earlier extenders may occupy this boundary.
+  while (left != begin || right != end) {
+    Boundary *boundary;
+    if (left == begin)
+      boundary = &*right++;
+    else if (right == end ||
+             callVA - baseVA(*std::prev(left)) < baseVA(*right) - callVA)
+      boundary = &*--left;
+    else
+      boundary = &*right++;
+    if (inBranchRange(callVA, boundary->getNextExtenderVA(kind)))
+      return boundary;
+  }
+  return nullptr;
+}
+
+struct Callsite {
+  Relocation &reloc;
+  const Boundary &boundary;
+
+  // Selected by the current proposal; null means a direct call.
+  Extender *extender = nullptr;
+
+  uint64_t getVA() const { return boundary.inputVA + reloc.offset; }
+};
+
 struct Callee {
   Callee(Symbol *sym, int64_t addend,
          const DenseMap<ConcatInputSection *, Boundary *> &inputBoundaries)
       : sym(sym), addend(addend) {
-    // A branch to an interior offset relies on the locally defined function's
-    // layout and therefore cannot be redirected through an interposable stub.
+    // A zero-addend callee whose address is resolved at runtime is reached
+    // through its stub.
     if (needsBinding(sym) && addend == 0)
       return;
+
     auto *defined = dyn_cast<Defined>(sym);
     if (!defined)
       return;
+
+    // A definition outside a ConcatInputSection has no modeled input boundary.
     auto *targetIsec = dyn_cast_or_null<ConcatInputSection>(defined->isec());
-    if (targetIsec)
-      targetBoundary = inputBoundaries.lookup(targetIsec);
+    if (!targetIsec)
+      return;
+
+    // A definition outside this TextOutputSegment has no Boundary in its table.
+    Boundary *boundary = inputBoundaries.lookup(targetIsec);
+    if (!boundary)
+      return;
+
+    // A local definition, or an interior location selected by a nonzero addend,
+    // follows the Boundary that models its input section.
+    targetBoundary = boundary;
   }
 
   // Stable target identity and binding shared by all planning passes.
   Symbol *const sym;
   const int64_t addend;
-  // Null when the target is outside this text segment.
+  // Boundary wrapping the callee's input section. Null when the callee uses a
+  // stub, lacks a compatible input section, or lies outside this text segment.
   const Boundary *targetBoundary = nullptr;
+
+  // Collected once in input and relocation-offset order. Layout changes
+  // preserve this order, so planning can split the callers without sorting.
+  SmallVector<Callsite, 1> callsites;
 };
 
 struct Extender {
@@ -174,15 +243,8 @@ struct Extender {
   uint64_t va = 0;
 };
 
-struct RelocRewrite {
-  RelocRewrite(Relocation &reloc, const Boundary &boundary, Extender &extender)
-      : reloc(reloc), boundary(boundary), extender(extender) {}
-
-  Relocation &reloc;
-  const Boundary &boundary;
-  Extender &extender;
-};
-
+// Canonical identity for a callee and addend. Non-binding definitions are
+// keyed by input location so aliases coalesce; other callees retain symbol
 using CalleeKey = std::tuple<const void *, uint64_t, int64_t>;
 
 static CalleeKey makeCalleeKey(Symbol *sym, int64_t addend) {
@@ -192,145 +254,164 @@ static CalleeKey makeCalleeKey(Symbol *sym, int64_t addend) {
   return {sym, 0, addend};
 }
 
-SmallVector<TextOutputSection *, 4>
-TextOutputSegment::collectConsecutiveOutputSections(TextOutputSection &first) {
-  const auto &sections = first.parent->getSections();
-  auto firstIt = llvm::find(sections, &first);
-  assert(firstIt != sections.end());
-  ArrayRef<OutputSection *> remaining(sections);
-  remaining = remaining.drop_front(firstIt - sections.begin());
-  return llvm::to_vector<4>(llvm::map_range(
-      remaining.take_while(
-          [](OutputSection *osec) { return osec->canHostExtenders(); }),
-      [](OutputSection *osec) { return cast<TextOutputSection>(osec); }));
+TextOutputSegment::TextOutputSegment(iterator first, iterator end)
+    : next(first) {
+  for (; next != end && (*next)->canHostExtenders(); ++next)
+    textOutputSections.push_back(cast<TextOutputSection>(*next));
+  assert(!textOutputSections.empty());
 }
-
-TextOutputSegment::TextOutputSegment(TextOutputSection &first)
-    : first(first), textOutputSections(collectConsecutiveOutputSections(first)),
-      boundaries(textOutputSections) {}
 
 namespace {
 
 class TextOutputSegmentPlanner {
 public:
-  TextOutputSegmentPlanner(TextOutputSection &first,
-                           ArrayRef<TextOutputSection *> textOutputSections,
-                           BoundaryTable &boundaries);
+  explicit TextOutputSegmentPlanner(TextOutputSegment &segment);
 
   void run();
 
 private:
-  enum class LayoutKind { reservation, proposal };
-
-  TextOutputSection &first;
   const uint32_t maxHops;
   const ExtenderKind chainKind;
   const ExtenderKind fallbackKind;
   ArrayRef<TextOutputSection *> textOutputSections;
-  BoundaryTable &boundaries;
-  DenseMap<CalleeKey, Callee *> calleesByKey;
+  BoundaryTable boundaries;
   SmallVector<Callee *, 0> callees;
-  // Per-frame state is separate from stable callee identity. Resolved VAs are
-  // broadly used, islands are common only for active callees, and thunks are
-  // rare, so the extender maps are populated lazily.
+  // Forced routing is retained only while reservations remain unchanged.
+  DenseSet<const Callsite *> forcedExtenderCallsites;
+  // Per-pass state is separate from stable callee identity. Resolved VAs are
+  // broadly used, islands are common only for callees that need extension, and
+  // thunks are rare, so the extender maps are populated lazily.
   DenseMap<const Callee *, uint64_t> calleeVAs;
   DenseMap<const Callee *, SmallVector<Extender *, 4>> calleeIslands;
   DenseMap<const Callee *, SmallVector<Extender *, 1>> calleeThunks;
-  SmallVector<Callee *, 0> activeCallees;
-  SmallVector<std::tuple<const Boundary *, Relocation *, Callee *>, 0>
-      directRelocs;
-  SmallVector<RelocRewrite *, 0> relocRewrites;
-  DenseMap<OutputSection *, uint64_t> outputSectionVAs;
+  // Estimated VAs for following non-hostable sections that contain callees.
+  // Their sizes remain stable across planning because they cannot host
+  // extenders.
+  DenseMap<OutputSection *, uint64_t> postTextOutputSegmentVAs;
   uint64_t textEndVA = 0;
-  DenseSet<const Relocation *> requiredExtenderRelocs;
 
-  void updateOutputSectionVAs();
-  std::optional<uint64_t> getOutputSectionVA(OutputSection *) const;
+  TextOutputSection &firstSection() const {
+    return *textOutputSections.front();
+  }
+  void updatePostTextOutputSegmentVAs();
+  std::optional<uint64_t> getPostTextOutputSegmentVA(OutputSection *) const;
   std::optional<uint64_t> resolveCalleeVA(const Callee &);
   std::optional<uint64_t> getCalleeVA(const Callee &) const;
-  void walkLayout(LayoutKind);
-  Boundary *findChainBoundary(uint64_t callVA, uint64_t anchorVA);
-  Extender *planBranchExtensionExtender(Callee &, Boundary &, ExtenderKind,
-                                        Extender *inwardIsland);
-  Extender *findReusableExtender(Callee &, uint64_t) const;
-  Extender *placeChainExtender(Callee &, uint64_t, bool force);
-  Extender *placeFallbackExtender(Callee &, uint64_t);
-  void planBranchExtension();
-  bool hasInvalidDirectCall();
-  bool recoverFromRejectedProposal();
+  // Evaluate the selected segment layout, propagate its end through stable
+  // following sections, and resolve callees against the combined result. The
+  // reservation layout models reserved space for planning; the proposal layout
+  // records candidate VAs for output sections and extenders for validation.
+  enum class LayoutKind { reservation, proposal };
+  void evaluateLayout(LayoutKind);
+
+  Boundary *findIslandBoundaryTowardCallsite(uint64_t callVA,
+                                             uint64_t chainTipVA);
+  Extender *planExtenderAtBoundary(Callee &callee, Boundary &boundary,
+                                   ExtenderKind kind, Extender *inwardIsland);
+  Extender *findReusableExtender(const Callee &callee, uint64_t callVA) const;
+  Extender *tryExtendIslandChain(Callee &callee, const Callsite &callsite,
+                                 Extender *chainTipIsland);
+  Extender *tryPlanIslandChain(Callee &callee, const Callsite &callsite);
+  Extender *planFallbackThunk(Callee &callee, uint64_t callVA);
+  enum class CallsiteSide { belowTarget, aboveTarget };
+  void planCallsite(Callee &callee, Callsite &callsite);
+  void planSide(Callee &callee, MutableArrayRef<Callsite> calls,
+                CallsiteSide side);
+  void planCallee(Callee &callee);
+  void buildBranchExtensionProposal();
+  // A proposed layout can be invalid because an extender cannot reach its next
+  // target or because a callsite cannot reach its selected target. The
+  // extenders in a rejected proposal are discarded before replanning, so grow
+  // the reservations for those extenders to preserve their space. If a direct
+  // callsite-to-callee edge becomes invalid, routing the call through an
+  // extender may recover the layout.
+  bool recoverFromInvalidProposal();
+  bool forceInvalidDirectCalls();
   bool isLayoutValid();
-  void materializeAcceptedPlan();
+  void materializeBranchExtensionPlan();
 };
 
-TextOutputSegmentPlanner::TextOutputSegmentPlanner(
-    TextOutputSection &first, ArrayRef<TextOutputSection *> textOutputSections,
-    BoundaryTable &boundaries)
-    : first(first), maxHops(config->branchRangeExtensionMaxHops),
+TextOutputSegmentPlanner::TextOutputSegmentPlanner(TextOutputSegment &segment)
+    : maxHops(config->branchRangeExtensionMaxHops),
       chainKind(ExtenderKind::island), fallbackKind(ExtenderKind::thunk),
-      textOutputSections(textOutputSections), boundaries(boundaries) {
+      textOutputSections(segment.getSections()),
+      boundaries(textOutputSections) {
   DenseMap<ConcatInputSection *, Boundary *> inputBoundaries;
-  for (Boundary &boundary : boundaries.entries()) {
+  for (auto &boundary : boundaries.entries()) {
     bool inserted =
         inputBoundaries.try_emplace(boundary.isec, &boundary).second;
     assert(inserted && "input section has more than one boundary");
   }
 
   // Bind every branch target while the temporary input index is available.
-  // Callee identity survives every planning retry; only the three planning
-  // maps are rebuilt.
-  for (Boundary &boundary : boundaries.entries())
-    for (Relocation &reloc : llvm::reverse(boundary.isec->relocs)) {
-      if (!target->hasAttr(reloc.type, RelocAttrBits::BRANCH))
-        continue;
-      Symbol *sym = cast<Symbol *>(reloc.referent);
-      Callee *&callee = calleesByKey[makeCalleeKey(sym, reloc.addend)];
+  // Callee identity and relocation bindings survive every planning retry.
+  DenseMap<CalleeKey, Callee *> calleesByKey;
+  SmallVector<Relocation *, 0> branches;
+  for (auto &boundary : boundaries.entries()) {
+    branches.clear();
+    for (auto &reloc : llvm::reverse(boundary.isec->relocs))
+      if (target->hasAttr(reloc.type, RelocAttrBits::BRANCH))
+        branches.push_back(&reloc);
+    auto byOffset = [](const Relocation *lhs, const Relocation *rhs) {
+      return lhs->offset < rhs->offset;
+    };
+    if (!llvm::is_sorted(branches, byOffset))
+      llvm::stable_sort(branches, byOffset);
+    for (Relocation *reloc : branches) {
+      Symbol *sym = cast<Symbol *>(reloc->referent);
+      auto &callee = calleesByKey[makeCalleeKey(sym, reloc->addend)];
       if (!callee) {
-        callee = make<Callee>(sym, reloc.addend, inputBoundaries);
+        callee = make<Callee>(sym, reloc->addend, inputBoundaries);
         callees.push_back(callee);
       }
+      callee->callsites.push_back({*reloc, boundary});
     }
+  }
 }
 
-void TextOutputSegmentPlanner::updateOutputSectionVAs() {
+void TextOutputSegmentPlanner::updatePostTextOutputSegmentVAs() {
+  TextOutputSection &first = firstSection();
   const auto &sections = first.parent->getSections();
   auto firstIt = llvm::find(sections, &first);
   assert(firstIt != sections.end());
 
-  // Writer has finalized and assigned every section preceding this text run.
-  for (OutputSection *section : llvm::make_range(sections.begin(), firstIt))
-    if (section->isNeeded())
-      outputSectionVAs.try_emplace(section, section->addr);
-
   assert(textOutputSections.size() <=
          static_cast<size_t>(sections.end() - firstIt));
   auto suffixBegin = std::next(firstIt, textOutputSections.size());
+  postTextOutputSegmentVAs.clear();
   uint64_t va = textEndVA;
-  for (OutputSection *section : llvm::make_range(suffixBegin, sections.end())) {
+  for (auto *section : llvm::make_range(suffixBegin, sections.end())) {
     if (!section->isNeeded())
       continue;
     va = alignToPowerOf2(va, section->align);
-    outputSectionVAs.try_emplace(section, va);
+    postTextOutputSegmentVAs.try_emplace(section, va);
     va += section->getSizeForAddressAssignment();
   }
 }
 
-std::optional<uint64_t> TextOutputSegmentPlanner::getOutputSectionVA(
+std::optional<uint64_t> TextOutputSegmentPlanner::getPostTextOutputSegmentVA(
     OutputSection *targetSection) const {
-  if (!targetSection || !targetSection->isNeeded())
-    return std::nullopt;
-  if (auto it = outputSectionVAs.find(targetSection);
-      it != outputSectionVAs.end())
+  assert(targetSection && targetSection->isNeeded() &&
+         "target section must exist and be needed");
+  if (auto it = postTextOutputSegmentVAs.find(targetSection);
+      it != postTextOutputSegmentVAs.end())
     return it->second;
   return std::nullopt;
 }
 
+// Once the current TextOutputSegment and following sections have reserved VAs,
+// compute callee VAs to evaluate branch reachability during planning. This
+// handles definitions within the segment and callees in following sections
+// whose sizes cannot change through extender insertion, such as __stubs.
 std::optional<uint64_t>
 TextOutputSegmentPlanner::resolveCalleeVA(const Callee &callee) {
   Symbol *sym = callee.sym;
   int64_t addend = callee.addend;
 
   if (sym->isInStubs() && addend == 0) {
-    if (auto sectionVA = getOutputSectionVA(in.stubs))
+    if (in.stubs->isFinal)
+      return sym->getStubVA();
+    if (auto sectionVA = getPostTextOutputSegmentVA(in.stubs))
       return *sectionVA + uint64_t(sym->stubsIndex) * target->stubSize;
     return std::nullopt;
   }
@@ -341,7 +422,9 @@ TextOutputSegmentPlanner::resolveCalleeVA(const Callee &callee) {
 
   if (in.objcStubs && defined->isec() == in.objcStubs->isec &&
       in.objcStubs->isNeeded()) {
-    if (auto sectionVA = getOutputSectionVA(in.objcStubs))
+    if (in.objcStubs->isec->isFinal)
+      return defined->getVA() + addend;
+    if (auto sectionVA = getPostTextOutputSegmentVA(in.objcStubs))
       return *sectionVA + defined->value + addend;
     return std::nullopt;
   }
@@ -361,32 +444,29 @@ TextOutputSegmentPlanner::getCalleeVA(const Callee &callee) const {
   return it->second;
 }
 
-void TextOutputSegmentPlanner::walkLayout(LayoutKind kind) {
-  outputSectionVAs.clear();
-  uint64_t va = first.addr;
+void TextOutputSegmentPlanner::evaluateLayout(LayoutKind kind) {
+  uint64_t va = firstSection().addr;
   MutableArrayRef<Boundary> entries = boundaries.entries();
   auto boundaryIt = entries.begin();
-  for (TextOutputSection *section : textOutputSections) {
-    va = alignToPowerOf2(va, section->align);
-    outputSectionVAs.try_emplace(section, va);
+  for (auto *osec : textOutputSections) {
+    va = alignToPowerOf2(va, osec->align);
+    uint64_t sectionVA = va;
     if (kind == LayoutKind::proposal)
-      section->addr = va;
+      osec->addr = sectionVA;
 
-    for (ConcatInputSection *isec : section->inputs) {
-      assert(boundaryIt != entries.end());
-      Boundary &boundary = *boundaryIt++;
-      assert(boundary.section == section && boundary.isec == isec);
+    while (boundaryIt != entries.end() && boundaryIt->section == osec) {
+      auto &boundary = *boundaryIt++;
 
-      va = alignToPowerOf2(va, isec->align);
+      va = sectionVA + alignToPowerOf2(va - sectionVA, boundary.isec->align);
       boundary.inputVA = va;
-      va += isec->getSize();
+      va += boundary.isec->getSize();
 
       if (kind == LayoutKind::reservation) {
         va += boundary.reservedSize;
         continue;
       }
       assert(kind == LayoutKind::proposal);
-      for (Extender *extender : boundary.plannedExtenders) {
+      for (auto *extender : boundary.plannedExtenders) {
         va = alignToPowerOf2(va, extender->align());
         extender->va = va;
         va += extender->size();
@@ -395,25 +475,25 @@ void TextOutputSegmentPlanner::walkLayout(LayoutKind kind) {
   }
   assert(boundaryIt == entries.end());
   textEndVA = va;
-  updateOutputSectionVAs();
+  updatePostTextOutputSegmentVAs();
   calleeVAs.clear();
-  for (Callee *callee : callees)
+  for (auto *callee : callees)
     if (std::optional<uint64_t> va = resolveCalleeVA(*callee))
       calleeVAs.try_emplace(callee, *va);
 }
 
-Boundary *TextOutputSegmentPlanner::findChainBoundary(uint64_t callVA,
-                                                      uint64_t anchorVA) {
-  if (callVA == anchorVA)
+Boundary *TextOutputSegmentPlanner::findIslandBoundaryTowardCallsite(
+    uint64_t callVA, uint64_t chainTipVA) {
+  if (callVA == chainTipVA)
     return nullptr;
-  bool upper = callVA > anchorVA;
-  uint64_t low = addSat(anchorVA, 1);
+  bool upper = callVA > chainTipVA;
+  uint64_t low = addSat(chainTipVA, 1);
   uint64_t high =
-      std::min(callVA - 1, addSat(anchorVA, target->backwardBranchRange));
+      std::min(callVA - 1, addSat(chainTipVA, target->backwardBranchRange));
   if (!upper) {
     low = std::max(addSat(callVA, 1),
-                   subSat(anchorVA, target->forwardBranchRange));
-    high = anchorVA - 1;
+                   subSat(chainTipVA, target->forwardBranchRange));
+    high = chainTipVA - 1;
   }
   return boundaries.findExtenderPlacementInRange(
       low, high,
@@ -421,7 +501,7 @@ Boundary *TextOutputSegmentPlanner::findChainBoundary(uint64_t callVA,
       chainKind);
 }
 
-Extender *TextOutputSegmentPlanner::planBranchExtensionExtender(
+Extender *TextOutputSegmentPlanner::planExtenderAtBoundary(
     Callee &callee, Boundary &boundary, ExtenderKind kind,
     Extender *inwardIsland) {
   uint64_t va = boundary.getNextExtenderVA(kind);
@@ -436,82 +516,60 @@ Extender *TextOutputSegmentPlanner::planBranchExtensionExtender(
 }
 
 Extender *
-TextOutputSegmentPlanner::findReusableExtender(Callee &callee,
+TextOutputSegmentPlanner::findReusableExtender(const Callee &callee,
                                                uint64_t callVA) const {
-  auto reachable = [callVA](Extender *extender) {
-    return inBranchRange(callVA, extender->va);
-  };
-  Extender *island = nullptr;
-  if (auto it = calleeIslands.find(&callee); it != calleeIslands.end())
-    if (auto found = llvm::find_if(it->second, reachable);
-        found != it->second.end())
-      island = *found;
-  Extender *thunk = nullptr;
-  if (auto it = calleeThunks.find(&callee); it != calleeThunks.end())
-    if (auto found = llvm::find_if(it->second, reachable);
-        found != it->second.end())
-      thunk = *found;
-  if (!island)
-    return thunk;
-  if (!thunk)
-    return island;
-  auto distance = [callVA](const Extender *extender) {
-    return callVA > extender->va ? callVA - extender->va
-                                 : extender->va - callVA;
-  };
-  return distance(island) <= distance(thunk) ? island : thunk;
-}
-
-Extender *TextOutputSegmentPlanner::placeChainExtender(Callee &callee,
-                                                       uint64_t callVA,
-                                                       bool force) {
-  uint64_t targetVA = *getCalleeVA(callee);
-  bool upper = callVA > targetVA;
-  uint64_t anchorVA = targetVA;
-  Extender *inwardIsland = nullptr;
-  uint32_t depth = 0;
-
-  // Continue from the outermost island already planned between this call and
-  // its target. This makes a relocation walk grow one shared chain per callee
-  // instead of rebuilding a chain for every callsite.
-  if (auto it = calleeIslands.find(&callee); it != calleeIslands.end()) {
-    for (Extender *extender : it->second) {
-      if ((extender->va > targetVA) != upper)
+  Extender *nearest = nullptr;
+  uint64_t bestDistance = UINT64_MAX;
+  auto consider = [&](ArrayRef<Extender *> extenders) {
+    for (Extender *extender : extenders) {
+      if (!inBranchRange(callVA, extender->va))
         continue;
-      if ((upper && extender->va >= callVA) ||
-          (!upper && extender->va <= callVA))
-        continue;
-      ++depth;
-      if ((upper && extender->va > anchorVA) ||
-          (!upper && extender->va < anchorVA)) {
-        anchorVA = extender->va;
-        inwardIsland = extender;
+      uint64_t distance =
+          callVA > extender->va ? callVA - extender->va : extender->va - callVA;
+      if (distance < bestDistance) {
+        nearest = extender;
+        bestDistance = distance;
       }
     }
-  }
+  };
+  if (auto it = calleeIslands.find(&callee); it != calleeIslands.end())
+    consider(it->second);
+  if (auto it = calleeThunks.find(&callee); it != calleeThunks.end())
+    consider(it->second);
+  return nearest;
+}
+
+Extender *TextOutputSegmentPlanner::tryExtendIslandChain(
+    Callee &callee, const Callsite &callsite, Extender *chainTipIsland) {
+  uint64_t callVA = callsite.getVA();
+  uint64_t chainTipVA =
+      chainTipIsland ? chainTipIsland->va : *getCalleeVA(callee);
+  // Count this chain's actual path, not other islands owned by the callee.
+  uint32_t depth = 0;
+  for (Extender *island = chainTipIsland; island; island = island->inwardIsland)
+    ++depth;
+  bool needsIsland =
+      forcedExtenderCallsites.contains(&callsite) && !chainTipIsland;
 
   SmallVector<std::pair<Extender *, uint32_t>, 4> added;
-  while (depth < maxHops && (force || !inBranchRange(callVA, anchorVA))) {
-    Boundary *boundary = findChainBoundary(callVA, anchorVA);
+  while (depth < maxHops &&
+         (needsIsland || !inBranchRange(callVA, chainTipVA))) {
+    Boundary *boundary = findIslandBoundaryTowardCallsite(callVA, chainTipVA);
     if (!boundary)
       break;
     uint32_t previousPlannedSize = boundary->plannedSize;
     Extender *extender =
-        planBranchExtensionExtender(callee, *boundary, chainKind, inwardIsland);
+        planExtenderAtBoundary(callee, *boundary, chainKind, chainTipIsland);
     added.emplace_back(extender, previousPlannedSize);
-    anchorVA = extender->va;
-    inwardIsland = extender;
+    chainTipVA = extender->va;
+    chainTipIsland = extender;
     ++depth;
-    force = false;
+    needsIsland = false;
   }
-  if (inBranchRange(callVA, anchorVA)) {
-    if (added.empty())
-      return findReusableExtender(callee, callVA);
-    return added.back().first;
-  }
+  if (chainTipIsland && inBranchRange(callVA, chainTipVA))
+    return chainTipIsland;
 
-  // An incomplete chain cannot route this relocation and must not affect the
-  // global island-edge sequence. Fall back to a thunk for this callsite.
+  // Undo only this attempt. Previously assigned callers keep their routes.
   for (auto [extender, previousPlannedSize] : llvm::reverse(added)) {
     extender->boundary.plannedSize = previousPlannedSize;
     assert(extender->boundary.plannedExtenders.back() == extender);
@@ -526,78 +584,115 @@ Extender *TextOutputSegmentPlanner::placeChainExtender(Callee &callee,
   return nullptr;
 }
 
-Extender *TextOutputSegmentPlanner::placeFallbackExtender(Callee &callee,
-                                                          uint64_t callVA) {
+Extender *
+TextOutputSegmentPlanner::tryPlanIslandChain(Callee &callee,
+                                             const Callsite &callsite) {
+  if (!maxHops)
+    return nullptr;
+  uint64_t callVA = callsite.getVA();
+  uint64_t targetVA = *getCalleeVA(callee);
+  bool upper = callVA > targetVA;
+  Extender *chainTip = nullptr;
+  // Prefer extending the outermost island between this caller and its target.
+  if (auto it = calleeIslands.find(&callee); it != calleeIslands.end())
+    for (Extender *island : it->second) {
+      if (upper ? island->va <= targetVA || island->va >= callVA
+                : island->va >= targetVA || island->va <= callVA)
+        continue;
+      if (!chainTip ||
+          (upper ? island->va > chainTip->va : island->va < chainTip->va))
+        chainTip = island;
+    }
+  if (chainTip)
+    if (Extender *extender = tryExtendIslandChain(callee, callsite, chainTip))
+      return extender;
+
+  // A short earlier chain may exhaust the hop budget. Try full-span hops from
+  // the target before falling back to a thunk for this caller.
+  return tryExtendIslandChain(callee, callsite, nullptr);
+}
+
+Extender *TextOutputSegmentPlanner::planFallbackThunk(Callee &callee,
+                                                      uint64_t callVA) {
   if (!target->supportsExtender(ExtenderKind::thunk))
     fatal("target does not support thunk fallback for " +
           toString(*callee.sym));
   if (Extender *extender = findReusableExtender(callee, callVA))
     return extender;
-
-  // Place the fallback at the inward edge of the callsite's branch window. This
-  // maximizes the range that later, nearer callsites can share.
-  uint64_t low = subSat(callVA, target->backwardBranchRange);
-  uint64_t high = addSat(callVA, target->forwardBranchRange);
-  auto targetVA = getCalleeVA(callee);
-  bool upper = targetVA && callVA >= *targetVA;
-  Boundary *boundary = boundaries.findExtenderPlacementInRange(
-      low, high,
-      upper ? BoundaryPreference::lowest : BoundaryPreference::highest,
-      fallbackKind);
+  Boundary *boundary =
+      boundaries.findExtenderPlacementNear(callVA, fallbackKind);
   if (!boundary)
     fatal("cannot place branch fallback extender for " + toString(*callee.sym));
-  Extender *fallback = planBranchExtensionExtender(
-      callee, *boundary, fallbackKind, /*inwardIsland=*/nullptr);
-  return fallback;
+  return planExtenderAtBoundary(callee, *boundary, fallbackKind,
+                                /*inwardIsland=*/nullptr);
 }
 
-void TextOutputSegmentPlanner::planBranchExtension() {
-  directRelocs.clear();
-  relocRewrites.clear();
-  activeCallees.clear();
+void TextOutputSegmentPlanner::planCallsite(Callee &callee,
+                                            Callsite &callsite) {
+  std::optional<uint64_t> calleeVA = getCalleeVA(callee);
+  uint64_t callVA = callsite.getVA();
+  if (!forcedExtenderCallsites.contains(&callsite) && calleeVA &&
+      inBranchRange(callVA, *calleeVA))
+    return;
+
+  Extender *extender = findReusableExtender(callee, callVA);
+  if (!extender && calleeVA)
+    extender = tryPlanIslandChain(callee, callsite);
+  if (!extender)
+    extender = planFallbackThunk(callee, callVA);
+  callsite.extender = extender;
+}
+
+void TextOutputSegmentPlanner::planSide(Callee &callee,
+                                        MutableArrayRef<Callsite> calls,
+                                        CallsiteSide side) {
+  // Grow shared chains from the nearest caller toward the furthest caller.
+  if (side == CallsiteSide::belowTarget) {
+    for (Callsite &callsite : llvm::reverse(calls))
+      planCallsite(callee, callsite);
+  } else {
+    for (Callsite &callsite : calls)
+      planCallsite(callee, callsite);
+  }
+}
+
+void TextOutputSegmentPlanner::planCallee(Callee &callee) {
+  std::optional<uint64_t> calleeVA = getCalleeVA(callee);
+  if (!calleeVA) {
+    for (Callsite &callsite : callee.callsites)
+      planCallsite(callee, callsite);
+    return;
+  }
+  auto split = llvm::lower_bound(callee.callsites, *calleeVA,
+                                 [](const Callsite &callsite, uint64_t va) {
+                                   return callsite.getVA() < va;
+                                 });
+  MutableArrayRef<Callsite> calls(callee.callsites);
+  size_t splitIdx = split - calls.begin();
+  planSide(callee, calls.take_front(splitIdx), CallsiteSide::belowTarget);
+  planSide(callee, calls.drop_front(splitIdx), CallsiteSide::aboveTarget);
+}
+
+void TextOutputSegmentPlanner::buildBranchExtensionProposal() {
+  // Routes belong to the previous proposal; identities survive replanning.
+  for (Callee *callee : callees)
+    for (Callsite &callsite : callee->callsites)
+      callsite.extender = nullptr;
   calleeIslands.clear();
   calleeThunks.clear();
   boundaries.resetPlannedSpace();
-  walkLayout(LayoutKind::reservation);
-  boundaries.initializeExtenderPlacementBoundaries();
-
-  // The reserved layout fixes every callsite address, so plan directly while
-  // walking the relocations and retain only rewrites that may be committed.
-  for (Boundary &boundary : boundaries.entries())
-    for (Relocation &reloc : llvm::reverse(boundary.isec->relocs)) {
-      if (!target->hasAttr(reloc.type, RelocAttrBits::BRANCH))
-        continue;
-      Symbol *sym = cast<Symbol *>(reloc.referent);
-      Callee *callee = calleesByKey.lookup(makeCalleeKey(sym, reloc.addend));
-      assert(callee && "branch target was not prebound");
-      std::optional<uint64_t> calleeVA = getCalleeVA(*callee);
-      uint64_t callVA = boundary.inputVA + reloc.offset;
-      if (calleeVA && inBranchRange(callVA, *calleeVA) &&
-          !requiredExtenderRelocs.contains(&reloc)) {
-        directRelocs.emplace_back(&boundary, &reloc, callee);
-        continue;
-      }
-      bool firstExtender =
-          !calleeIslands.contains(callee) && !calleeThunks.contains(callee);
-      if (firstExtender)
-        activeCallees.push_back(callee);
-      Extender *extender = findReusableExtender(*callee, callVA);
-      if (!extender && calleeVA)
-        extender = placeChainExtender(*callee, callVA,
-                                      requiredExtenderRelocs.contains(&reloc));
-      if (!extender)
-        extender = placeFallbackExtender(*callee, callVA);
-      relocRewrites.push_back(make<RelocRewrite>(reloc, boundary, *extender));
-    }
-  walkLayout(LayoutKind::proposal);
+  evaluateLayout(LayoutKind::reservation);
+  for (Callee *callee : callees)
+    planCallee(*callee);
+  evaluateLayout(LayoutKind::proposal);
 }
 
 bool TextOutputSegmentPlanner::isLayoutValid() {
   // Every island must reach its next inward island or the final callee. Thunks
   // need no such check because they can reach any target.
-  for (const auto &entry : calleeIslands)
-    for (const auto *island : entry.second) {
-      std::optional<uint64_t> calleeVA = getCalleeVA(island->callee);
+  for (const auto &[callee, islands] : calleeIslands)
+    for (const auto *island : islands) {
+      std::optional<uint64_t> calleeVA = getCalleeVA(*callee);
       assert(calleeVA && "island target has no VA");
       uint64_t targetVA =
           island->inwardIsland ? island->inwardIsland->va : *calleeVA;
@@ -605,28 +700,25 @@ bool TextOutputSegmentPlanner::isLayoutValid() {
         return false;
     }
 
-  // Every callsite must reach its selected target: an extender for a rewritten
-  // relocation or the callee for a direct relocation.
-  for (const auto *rewrite : relocRewrites)
-    if (!inBranchRange(rewrite->boundary.inputVA + rewrite->reloc.offset,
-                       rewrite->extender.va))
-      return false;
-  for (auto [boundary, reloc, callee] : directRelocs) {
+  // Every callsite must reach its selected extender or its direct target.
+  for (const Callee *callee : callees) {
     std::optional<uint64_t> calleeVA = getCalleeVA(*callee);
-    if (!calleeVA ||
-        !inBranchRange(boundary->inputVA + reloc->offset, *calleeVA))
-      return false;
+    for (const Callsite &callsite : callee->callsites) {
+      if (callsite.extender) {
+        if (!inBranchRange(callsite.getVA(), callsite.extender->va))
+          return false;
+      } else if (forcedExtenderCallsites.contains(&callsite) || !calleeVA ||
+                 !inBranchRange(callsite.getVA(), *calleeVA))
+        return false;
+    }
   }
   return true;
 }
 
-void TextOutputSegmentPlanner::materializeAcceptedPlan() {
+void TextOutputSegmentPlanner::materializeBranchExtensionPlan() {
   DenseMap<Extender *, TextOutputSection::ExtenderArtifact> artifacts;
-  DenseMap<TextOutputSection *,
-           SmallVector<TextOutputSection::MaterializedExtender, 0>>
-      bySection;
 
-  parallelForEach(activeCallees, [&](Callee *callee) {
+  parallelForEach(callees, [&](Callee *callee) {
     auto byVA = [](const Extender *lhs, const Extender *rhs) {
       return lhs->va < rhs->va;
     };
@@ -637,7 +729,7 @@ void TextOutputSegmentPlanner::materializeAcceptedPlan() {
   });
 
   // Declare every extender before populating any body so island chains may
-  // refer across output-section boundaries.
+  // refer an existing extender via the corresponding isec.
   auto declareExtenders = [&](Callee &callee, ArrayRef<Extender *> extenders) {
     Symbol *targetSym = callee.sym;
     int64_t addend = callee.addend;
@@ -659,70 +751,72 @@ void TextOutputSegmentPlanner::materializeAcceptedPlan() {
       artifacts.insert({extender, artifact});
     }
   };
-  for (Callee *callee : activeCallees) {
+  for (auto *callee : callees) {
     if (auto it = calleeIslands.find(callee); it != calleeIslands.end())
       declareExtenders(*callee, it->second);
     if (auto it = calleeThunks.find(callee); it != calleeThunks.end())
       declareExtenders(*callee, it->second);
   }
 
-  for (Boundary &boundary : boundaries.entries()) {
-    for (Extender *extender : boundary.plannedExtenders) {
-      Symbol *bodyTarget = extender->inwardIsland
-                               ? artifacts.lookup(extender->inwardIsland).sym
-                               : extender->callee.sym;
-      int64_t bodyAddend = extender->inwardIsland ? 0 : extender->callee.addend;
-      if (extender->kind == fallbackKind)
-        assert(needsBinding(extender->callee.sym) ==
-               extender->callee.sym->isInStubs());
-      auto artifact = artifacts.lookup(extender);
-      target->populateExtender(artifact.isec, extender->kind, bodyTarget,
-                               bodyAddend);
-      bySection[boundary.section].push_back(
-          {boundary.isec, artifact.isec, extender->va});
-    }
-  }
-
-  for (RelocRewrite *rewrite : relocRewrites) {
-    rewrite->reloc.referent =
-        static_cast<Symbol *>(artifacts.lookup(&rewrite->extender).sym);
-    rewrite->reloc.addend = 0;
-  }
-
-  uint64_t va = first.addr;
-  for (TextOutputSection *section : textOutputSections) {
+  uint64_t va = firstSection().addr;
+  ArrayRef<Boundary> entries = boundaries.entries();
+  auto boundaryIt = entries.begin();
+  // Boundary entries are grouped by output section. Store each section's
+  // accepted placements for Writer to finalize after planning the entire run.
+  for (auto *section : textOutputSections) {
     va = alignToPowerOf2(va, section->align);
-    uint64_t sectionVA = va;
-    assert(section->addr == sectionVA);
-    section->finalizeWithExtenders(bySection[section]);
-    va += section->getSize();
+    assert(section->addr == va);
+    SmallVector<TextOutputSection::ExtenderPlacement, 0> placements;
+    while (boundaryIt != entries.end() && boundaryIt->section == section) {
+      const auto &boundary = *boundaryIt++;
+      for (auto *extender : boundary.plannedExtenders) {
+        Symbol *bodyTarget = extender->inwardIsland
+                                 ? artifacts.lookup(extender->inwardIsland).sym
+                                 : extender->callee.sym;
+        int64_t bodyAddend =
+            extender->inwardIsland ? 0 : extender->callee.addend;
+        if (extender->kind == fallbackKind)
+          assert(needsBinding(extender->callee.sym) ==
+                 extender->callee.sym->isInStubs());
+        auto artifact = artifacts.lookup(extender);
+        target->populateExtender(artifact.isec, extender->kind, bodyTarget,
+                                 bodyAddend);
+        placements.push_back({boundary.isec, artifact.isec});
+      }
+      va = boundary.getInputEndVA() + boundary.plannedSize;
+    }
+    section->setExtenderPlacements(std::move(placements), va - section->addr);
   }
+  assert(boundaryIt == entries.end());
   assert(va == textEndVA);
+
+  for (Callee *callee : callees)
+    for (Callsite &callsite : callee->callsites)
+      if (callsite.extender) {
+        callsite.reloc.referent =
+            static_cast<Symbol *>(artifacts.lookup(callsite.extender).sym);
+        callsite.reloc.addend = 0;
+      }
 }
 
-bool TextOutputSegmentPlanner::hasInvalidDirectCall() {
-  bool registeredNewCallsite = false;
-  for (auto [boundary, reloc, callee] : directRelocs) {
+bool TextOutputSegmentPlanner::forceInvalidDirectCalls() {
+  bool forcedNewCallsite = false;
+  for (Callee *callee : callees) {
     std::optional<uint64_t> calleeVA = getCalleeVA(*callee);
     if (!calleeVA)
       continue;
-
-    uint64_t callVA = boundary->inputVA + reloc->offset;
-    if (!inBranchRange(callVA, *calleeVA)) {
-      requiredExtenderRelocs.insert(reloc);
-      registeredNewCallsite = true;
-    }
+    for (Callsite &callsite : callee->callsites)
+      if (!callsite.extender && !inBranchRange(callsite.getVA(), *calleeVA)) {
+        assert(!forcedExtenderCallsites.contains(&callsite) &&
+               "direct call already requires an extender");
+        forcedExtenderCallsites.insert(&callsite);
+        forcedNewCallsite = true;
+      }
   }
-  return registeredNewCallsite;
+  return forcedNewCallsite;
 }
 
-// A proposed layout can fail because an island cannot reach its next target or
-// because a callsite cannot reach its selected target. The extenders in a
-// rejected proposal are discarded before replanning, so grow the reservations
-// for those extenders to preserve their space. If a direct callsite-to-callee
-// edge becomes invalid, routing the call through an extender may recover the
-// layout.
-bool TextOutputSegmentPlanner::recoverFromRejectedProposal() {
+bool TextOutputSegmentPlanner::recoverFromInvalidProposal() {
   bool grewReservation = false;
   for (auto &boundary : boundaries.entries())
     if (boundary.reservedSize < boundary.plannedSize) {
@@ -730,14 +824,11 @@ bool TextOutputSegmentPlanner::recoverFromRejectedProposal() {
       grewReservation = true;
     }
   if (grewReservation) {
-    // Registered callsites are specific to a fixed reservation layout.
-    // Reconsider direct calls from scratch after growth changes that layout.
-    requiredExtenderRelocs.clear();
+    // Reconsider direct calls against the new reservation layout.
+    forcedExtenderCallsites.clear();
     return true;
   }
-  if (hasInvalidDirectCall())
-    return true;
-  return false;
+  return forceInvalidDirectCalls();
 }
 
 void TextOutputSegmentPlanner::run() {
@@ -745,30 +836,34 @@ void TextOutputSegmentPlanner::run() {
   constexpr size_t maxPassCount = 30;
   size_t pass = 1;
   for (; pass <= maxPassCount; ++pass) {
-    planBranchExtension();
+    buildBranchExtensionProposal();
     if (isLayoutValid())
       break;
-    if (!recoverFromRejectedProposal())
+    if (!recoverFromInvalidProposal())
       fatal("branch extension can't recover from failure");
   }
   if (pass > maxPassCount)
     fatal("branch extender did not converge");
-  materializeAcceptedPlan();
+  materializeBranchExtensionPlan();
+  size_t extenderTargetCount = llvm::count_if(callees, [&](Callee *callee) {
+    return calleeIslands.contains(callee) || calleeThunks.contains(callee);
+  });
   size_t extenderCount = 0;
   for (const Boundary &boundary : boundaries.entries())
     extenderCount += boundary.plannedExtenders.size();
+  auto &first = firstSection();
   log("branch extender for " + first.parent->name + "," + first.name +
       ": passes = " + std::to_string(pass) +
       ", inputs = " + std::to_string(boundaries.size()) +
-      ", targets = " + std::to_string(activeCallees.size()) +
+      ", targets = " + std::to_string(extenderTargetCount) +
       ", total extenders = " + std::to_string(extenderCount));
 }
 
 } // namespace
 
-size_t TextOutputSegment::finalize() {
-  TextOutputSegmentPlanner planner(first, textOutputSections, boundaries);
+TextOutputSegment::iterator TextOutputSegment::planBranchRangeExtension() {
+  TextOutputSegmentPlanner planner(*this);
   planner.run();
-  return size();
+  return next;
 }
 } // namespace lld::macho

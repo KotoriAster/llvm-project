@@ -1,9 +1,12 @@
 # REQUIRES: aarch64
 
+## Visit callers below the stub in descending address order. _foo selects a
+## thunk at the lowest legal boundary, and _main reuses that same thunk.
+
 # RUN: llvm-mc -filetype=obj -triple=arm64-apple-darwin %s -o %t.o
 # RUN: %lld -arch arm64 -U _extern_sym -o %t %t.o \
 # RUN:   --branch-range-extension-max-hops=0
-# RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t | FileCheck %s
+# RUN: llvm-objdump --no-print-imm-hex -d --no-show-raw-insn %t | FileCheck %s --implicit-check-not='.thunk.1'
 
 # CHECK-LABEL: Disassembly of section __TEXT,__text:
 
@@ -15,7 +18,7 @@
 # CHECK: [[#THUNK]] <_extern_sym.thunk.0>:
 
 # CHECK-LABEL: <_foo>:
-# CHECK-NEXT:    bl 0x[[#%x,THUNK:]] <_extern_sym.thunk.0>
+# CHECK-NEXT:    bl 0x[[#THUNK]] <_extern_sym.thunk.0>
 # CHECK-NEXT:    ret
 
 # CHECK-LABEL: Disassembly of section __TEXT,__lcxx_override:
